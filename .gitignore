@@ -1,0 +1,17 @@
+# PlatformIO build output and downloaded libraries
+.pio/
+
+# Sketch-to-C++ conversion output PlatformIO may leave next to the .ino
+*.ino.cpp
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Firmware images and flash dumps (can contain Wi-Fi credentials and NVS data)
+*.bin
+*.elf
+*.map
