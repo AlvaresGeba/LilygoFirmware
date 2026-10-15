@@ -20,11 +20,24 @@ phone app's job.
   link and battery on every screen.
 - **Voice commands**: double-press the side button, speak, press once to send.
   Audio is 16 kHz / 16-bit mono PCM, up to 8 seconds.
+- **Server answers and errors on screen**: an icon and a colored label show
+  whether the answer is `OK` (check), `REJECTED` (!) or `ERROR` (cross),
+  with its own vibration for failures.
+  Text wraps by word (built-in 6x8 font, Latin only). Errors the watch
+  detects itself (no phone, link lost) look the same.
+- **Response timer**: the waiting screens count up from the moment the
+  command is sent; the answer screen and the menu show how long it took.
+- **Never gives up on a command**: while a command is on its way the watch
+  stays awake until the answer or an error arrives (the backlight dims after
+  30 s). Only on battery below 30 % does it fall back to timeouts.
 - **Deep sleep** between uses; wakes on a tap or the side button.
 - **Settings** stored in flash: brightness (5–100 %), interface color, screen
   timeout, vibration, 180° screen rotation.
 - **Haptic feedback** through the built-in DRV2605 motor driver.
-- **Clock sync** from the phone on every connect, kept in the PCF8563 RTC.
+- **Accurate clock**: the PCF8563 RTC (quartz) is the reference and is
+  checked on every wake; the phone sets it on every connect, and once a day
+  the watch fetches the time by itself with the screen off. See
+  [Time keeping](#time-keeping).
 
 ## Hardware
 
@@ -60,6 +73,10 @@ T-Watch S3 it is a plain push button with no rotary encoder (LilyGoLib reports
 
 The watch goes back to sleep on its own: after the screen timeout on the clock,
 15 s on the info screen, 20 s in settings, and 10 s after showing an answer.
+It does not time out while a command is being delivered (waiting for the
+phone, sending, waiting for the server), unless the battery is below 30 %
+and not charging; then it waits 20 s for the phone and 60 s for the answer.
+A single press cancels the wait at any time.
 
 In **Settings**, tap *Brightness*, *Color* or *Sleep after* to open a slider and
 drag a finger along it; tap *Vibration* or *Rotate* to toggle them.
@@ -77,15 +94,23 @@ Service `6e400001-b5a3-f393-e0a9-e50e24dcca9e`:
 | COMMAND | `6e400002-…` | notify, watch → phone | `[u16 chunk index LE][u16 total chunks LE][up to 508 bytes of PCM]` |
 | STATUS | `6e400003-…` | notify, watch → phone | ASCII `DONE` after the last chunk |
 | RESPONSE | `6e400004-…` | write, phone → watch | UTF-8 text to show (up to 500 bytes) |
-| TIME | `6e400005-…` | write, phone → watch | ASCII `<unix seconds>,<UTC offset in minutes>` |
+| TIME | `6e400005-…` | write, phone → watch | ASCII `<unix seconds>,<UTC offset in minutes>[,<milliseconds>]` |
+| TIME | `6e400005-…` | read | the watch's clock: `<unix seconds>.<ms>,<UTC offset>` |
+
+RESPONSE texts starting with `OK`, `REJECTED` or `ERROR` (the gateway's
+contract) are final answers and are shown with that status. `Processing...`
+and `STATUS: …` are progress: the watch shows them on the waiting screen and
+keeps waiting for the final answer. Anything else is shown as a plain answer.
 
 The app should:
 
 1. Request an ATT MTU of 517: chunks are 512 bytes and do not fit a smaller MTU.
 2. Subscribe to COMMAND and STATUS. The watch only sends once both
    subscriptions are in place.
-3. Write TIME after subscribing. This is optional: without it the clock keeps
-   whatever time the RTC has.
+3. Write TIME after subscribing, on every connection. The optional
+   milliseconds field makes the clock exact to a few tens of milliseconds.
+   The watch's daily background sync relies on this: it wakes, advertises
+   for 20 s and goes back to sleep as soon as TIME is written.
 4. On `DONE`, join the chunks in index order and check that the count matches
    `total chunks`.
 
@@ -113,13 +138,77 @@ The watch only shows up as a USB serial port (`/dev/ttyACM*`) while it is
 awake. Tap the screen just before uploading, or start the upload and wake the
 watch while PlatformIO waits for the port.
 
-### Setting the time over USB
+### USB console
 
-Until the phone app has synced it, the clock can be set over the serial port by
-sending `T<unix seconds> <UTC offset in minutes>` and a newline, for example:
+While awake, the watch takes commands on the serial port (115200 baud, one
+per line); `H` lists them:
+
+| Command | Does |
+|---|---|
+| `T<unix>[.<frac>] [<offset min>]` | set the clock, e.g. `T1760000000.25 120` |
+| `Q` | clock report: system clock, RTC, sleep clock, last correction |
+| `R` | wait for the RTC's next second and report it (sub-second phase) |
+| `Z<sec>` | deep sleep now, wake by timer (drift tests) |
+| `C<0\|1>` | sleep clock: 0 = RC 136 kHz (default), 1 = RC_FAST/256 (saved) |
+| `N<0\|1>` | RTC correction on wake off/on (tests; off lasts until reset) |
+| `S` | hardware probe: I2C devices, sensors, radio, GPS, microphone |
+| `P<sec>` | raw touch controller registers for <sec> seconds (diagnosing touch wakes) |
+| `W` | UI test: the waiting screen with the response timer running |
+| `A<text>` | UI test: an answer from the server, e.g. `AOK: lights on`, `AERROR: timeout` |
+
+`tools/watch_console.py` sends them and prints the answers:
 
 ```sh
-printf 'T%d %d\n' "$(date +%s)" 120 > /dev/ttyACM0
+tools/watch_console.py --set-time      # set the clock from this computer
+tools/watch_console.py S               # list and check the sensors
+```
+
+## Time keeping
+
+In deep sleep the ESP32-S3 keeps time with its RTC timer, clocked by an
+internal RC oscillator whose frequency is far from its awake calibration.
+The old firmware trusted it across every sleep, so the clock ran ahead by
+minutes a day. Measured on this watch with `tools/clock_drift_test.py`:
+
+| clock | drift in deep sleep |
+|---|---|
+| ESP32-S3 RC 136 kHz (IDF default) | +2800 ppm over 1-minute sleeps (+4 min/day); +1.7 % over a 36-minute sleep |
+| ESP32-S3 RC_FAST/256 (17.5 MHz RC / 256) | −23 %, about −5 h/day |
+| PCF8563 (32.768 kHz quartz) | +7.7 ppm, about +0.7 s/day |
+
+Now:
+
+1. **The PCF8563 is the reference.** On every wake the system clock is
+   pulled into the RTC's current second if it has wandered off
+   (`rtcCorrectionUs` in `lib/WatchCore`); within the next second, while the
+   screen is on anyway, the watch catches the moment the RTC's seconds
+   register changes and steps the clock onto that exact boundary
+   (`rtcTickCorrectionUs`). Measured: within 16 ms of NTP time after every test
+   wake (sleeps of 20-60 s; the error no longer grows with sleep length).
+2. **The RTC is written in phase.** The PCF8563's 1 Hz divider is not reset
+   by writing the time, so the watch stops it (STOP bit, which clears the
+   divider), loads the time and releases it so that its first tick, 1.0009 s
+   later (measured), lands on the system clock's second boundary.
+3. **The sleep clock is the 136 kHz RC**, calibrated against the 40 MHz
+   crystal right before each sleep. RC_FAST/256 is selectable with `C1` for
+   experiments, but it is much worse in deep sleep and costs ~5 µA more.
+4. **The phone corrects the RTC** on every connection (TIME, with
+   milliseconds). If the phone has not connected for 24 hours the watch
+   wakes by itself with the screen off, advertises for 20 s and sleeps again
+   as soon as it has the time. Failed attempts are retried after 1, 2, 4, …
+   hours, and skipped below 15 % battery. Daily is plenty: the PCF8563 gains
+   under a second a day, and each background wake costs radio time.
+
+`tools/clock_drift_test.py` measures all of this on the watch against the
+computer's NTP-synced clock: the drift of both sleep clocks with the
+correction off, the PCF8563's drift, and the end-to-end error with the
+correction on.
+
+## Tests
+
+```sh
+pio test -e native                          # unit tests of lib/WatchCore, on the PC
+tools/clock_drift_test.py --cycles 6 --sleep 60   # on the watch (awake, plugged in)
 ```
 
 ## Troubleshooting
@@ -139,7 +228,17 @@ printf 'T%d %d\n' "$(date +%s)" 120 > /dev/ttyACM0
 
 ```
 .
-├── platformio.ini               # board, flash/PSRAM, libraries, display setup
-└── src/
-    └── twatch_command_client.ino
+├── platformio.ini               # board, flash/PSRAM, libraries, display setup; native test env
+├── src/
+│   └── twatch_command_client.ino   # the firmware
+├── lib/WatchCore/src/           # hardware-independent logic, unit-tested on the PC
+│   ├── clock_sync.*             # TIME parsing, RTC correction, background sync schedule
+│   ├── server_reply.*           # OK/REJECTED/ERROR/progress, safe UTF-8 copy
+│   ├── power_policy.h           # when the watch may time out / sync in the background
+│   ├── text_wrap.*              # word wrap by pixel width, UTF-8 aware
+│   └── time_format.*            # response timer and duration text
+├── test/                        # Unity tests for lib/WatchCore (pio test -e native)
+└── tools/
+    ├── clock_drift_test.py      # drift measurement on the watch
+    └── watch_console.py         # USB console client (sensor probe, set time)
 ```

@@ -15,3 +15,6 @@
 *.bin
 *.elf
 *.map
+
+# Python bytecode from tools/
+__pycache__/
