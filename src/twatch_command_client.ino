@@ -76,8 +76,7 @@
 #include "power_policy.h"
 #include "server_reply.h"
 #include "text_wrap.h"
-#include "fonts/ui_font_16.h"
-#include "fonts/ui_font_20.h"
+#include "time_format.h"
 
 // ---------------------------------------------------------------------
 // Hardware pins (TTGO_TWatch_Library utilities.h, USING_TWATCH_S3)
@@ -158,11 +157,14 @@ static const watch::SyncSchedule kSyncSchedule = {
 #define BG_SYNC_WINDOW_MS 20000  // background sync: advertise this long, screen off
 #define SYNC_PERSIST_S    3600   // write the last sync time to flash at most hourly
 
-// RTC_SLOW_CLK during deep sleep. RC_FAST/256 (~68 kHz from the 17.5 MHz
-// RC oscillator) is more stable over temperature than the default 136 kHz
-// RC, for ~5 uA more in deep sleep. Selectable from the console ("C").
+// RTC_SLOW_CLK during deep sleep, selectable from the console ("C").
+// Measured on this watch with tools/clock_drift_test.py: the 136 kHz RC
+// runs ~+2600 ppm fast in deep sleep; RC_FAST/256 (~68 kHz from the 17.5 MHz
+// RC) runs ~23 % slow in deep sleep against its awake calibration (the
+// RTC domain's lower sleep voltage, probably), and costs ~5 uA more. So
+// the 136 kHz RC is the default, and the PCF8563 corrects either on wake.
 enum SleepClock : uint8_t { SLEEP_CLOCK_RC136K = 0, SLEEP_CLOCK_RCFAST_D256 = 1 };
-#define SLEEP_CLOCK_DEFAULT  SLEEP_CLOCK_RCFAST_D256
+#define SLEEP_CLOCK_DEFAULT  SLEEP_CLOCK_RC136K
 #define SLEEP_CLOCK_CAL_CYCLES 3000   // IDF's default for RC_FAST/256: ~44 ms
 
 // ---------------------------------------------------------------------
@@ -216,6 +218,7 @@ RTC_DATA_ATTR int64_t lastSyncEpoch = 0;       // last time set by the phone/con
 RTC_DATA_ATTR uint8_t bgSyncFailures = 0;      // background attempts that found no phone
 RTC_DATA_ATTR int64_t lastWakeCorrectionUs = 0;  // diagnostics: RTC correction at the last boot
 RTC_DATA_ATTR bool rtcResyncDisabled = false;  // diagnostics: measure the raw sleep clock
+int64_t lastTickCorrectionUs = 0;   // diagnostics: sub-second step from the RTC tick, this boot
 
 enum WakePlan : uint8_t { WAKE_PLAN_NONE, WAKE_PLAN_SYNC, WAKE_PLAN_TEST };
 RTC_DATA_ATTR uint8_t wakePlan = WAKE_PLAN_NONE;  // why the sleep timer was armed
@@ -237,7 +240,19 @@ uint32_t screenSince = 0;           // millis() when the screen was entered or l
 uint32_t litSince = 0;              // millis() of the last activity that lit the backlight
 char waitDetail[96] = "";           // progress line from the phone while waiting
 
+// Response timer: runs from the moment a command is sent off (the recording
+// stops) to its final answer or error. The watch does not sleep meanwhile,
+// so millis() is continuous.
+bool commandPending = false;
+uint32_t commandStartedAt = 0;      // millis()
+RTC_DATA_ATTR uint32_t lastResponseMs = 0;  // how long lastResponse took; 0 = not timed
+
 enum Press : uint8_t { PRESS_NONE, PRESS_SINGLE, PRESS_DOUBLE };
+
+// Declared up here because the Arduino build puts its generated function
+// prototypes above the first function, and some of them use these types.
+enum ReplyIcon : uint8_t { ICON_CHECK, ICON_CROSS, ICON_BANG, ICON_DOTS };
+struct ReplyStyle { uint16_t color; const char *title; uint8_t haptic; ReplyIcon icon; };
 
 void goToSleep();
 void startBle();
@@ -441,16 +456,43 @@ int rtcSecondsRegister() {
 
 bool clockValid() { return watch::isValidEpoch(time(nullptr)); }
 
-// After a new time is set, the RTC is written at the start of the next
-// second, so its (whole-second) count starts in step with the system clock.
+// STOP bit (Control_1 bit 5): stops the PCF8563 and clears its divider chain.
+void rtcSetStop(bool stop) {
+  Wire.beginTransmission(PCF8563_ADDR);
+  Wire.write(0x00);
+  Wire.write(stop ? 0x20 : 0x00);
+  Wire.endTransmission();
+}
+
+// After a new time is set, the RTC is loaded so that its seconds tick in
+// step with the system clock. Writing the time registers alone does not
+// reset the PCF8563's 1 Hz divider, so the new second would tick at an
+// arbitrary phase, up to a second off. Instead the clock is stopped (which
+// clears the divider), loaded with second B-1 and released so that its
+// first tick, which comes a fixed RTC_RELEASE_TO_TICK_US after the release,
+// lands on the system clock's second B. The delay was measured with the
+// console's "R" on this watch (tick 493 ms late with 507874 us).
 bool rtcWritePending = false;
+static const int64_t RTC_RELEASE_TO_TICK_US = 1000928;
 
 void serviceRtcWrite(bool now) {
   if (!rtcWritePending) return;
-  int64_t us = nowUs();
-  // loop() runs every <= 20 ms, so this window catches every second.
-  if (!now && us % 1000000 > 30000) return;
-  rtcWrite((time_t)(us / 1000000));
+  const int64_t us = nowUs();
+  int64_t tickAt = (us / 1000000 + 1) * 1000000;
+  int64_t releaseAt = tickAt - RTC_RELEASE_TO_TICK_US;
+  // The stop and the time write take ~1 ms on the bus: leave room for them.
+  while (releaseAt - us < 5000) {
+    tickAt += 1000000;
+    releaseAt += 1000000;
+  }
+  // loop() runs every <= 20 ms, so this window catches every second; the
+  // rest is a short busy wait. Before sleeping it waits up to a second.
+  if (!now && releaseAt - us > 30000) return;
+  rtcSetStop(true);
+  rtcWrite((time_t)(tickAt / 1000000 - 1));
+  while (nowUs() < releaseAt) {
+  }
+  rtcSetStop(false);
   rtcWritePending = false;
 }
 
@@ -478,6 +520,35 @@ void applyTime(const watch::TimeMessage &m, const char *source) {
                 (long long)offsetMs, (long long)sinceLast);
 }
 
+// The wake correction only knows the RTC's whole second (+-0.5 s). The
+// moment its seconds register changes is an exact second boundary, so while
+// awake loop() watches for it once, which takes at most a second, and steps
+// the system clock onto it, to within one loop pass (loop() runs fast meanwhile).
+bool rtcTickLockPending = false;
+int rtcTickLockFrom = -1;           // seconds register at the first poll
+
+void serviceRtcTickLock() {
+  if (!rtcTickLockPending) return;
+  // A new time from the phone or console supersedes it (and is written to
+  // the RTC in phase anyway).
+  if (rtcWritePending || rtcResyncDisabled) {
+    rtcTickLockPending = false;
+    return;
+  }
+  const int sec = rtcSecondsRegister();
+  if (rtcTickLockFrom < 0) {
+    rtcTickLockFrom = sec;
+    return;
+  }
+  if (sec == rtcTickLockFrom) return;
+  const int64_t us = nowUs();
+  rtcTickLockPending = false;
+  time_t rtc;
+  if (!rtcRead(rtc)) return;
+  lastTickCorrectionUs = watch::rtcTickCorrectionUs(us, rtc);
+  setNowUs(nowUs() + lastTickCorrectionUs);
+}
+
 // Every boot, also after a deep-sleep wake. The system clock kept running
 // in deep sleep on the drifting RC oscillator; the PCF8563 is the
 // reference. After a power-on the system clock starts from zero and is
@@ -491,10 +562,11 @@ void loadClock() {
     const int64_t correction = watch::rtcCorrectionUs(nowUs(), rtc);
     lastWakeCorrectionUs = correction;
     if (correction != 0 && !rtcResyncDisabled) setNowUs(nowUs() + correction);
+    rtcTickLockPending = true;
   } else if (clockValid()) {
     // The RTC lost its time (VL set, e.g. battery ran flat) but the system
     // clock survived: put it back.
-    rtcWrite(time(nullptr));
+    rtcWritePending = true;     // written in phase by serviceRtcWrite()
   }
 }
 
@@ -539,11 +611,11 @@ void printClockReport() {
   time_t rtc = 0;
   const bool rtcOk = rtcRead(rtc);
   Serial.printf("CLK sys=%lld.%06lld rtc=%lld rtc_ok=%d tz=%d src=%s cal=%u corr_us=%lld "
-                "resync=%d synced=%lld bgfail=%u wake=%d\n",
+                "resync=%d synced=%lld bgfail=%u wake=%d tick_us=%lld\n",
                 (long long)(us / 1000000), (long long)(us % 1000000), (long long)rtc, rtcOk,
                 tzOffsetMin, sleepClockName(cfg.sleepClock), (unsigned)esp_clk_slowclk_cal_get(),
                 (long long)lastWakeCorrectionUs, !rtcResyncDisabled, (long long)lastSyncEpoch,
-                bgSyncFailures, (int)esp_sleep_get_wakeup_cause());
+                bgSyncFailures, (int)esp_sleep_get_wakeup_cause(), (long long)lastTickCorrectionUs);
 }
 
 // Waits for the PCF8563 seconds register to change and reports that
@@ -679,7 +751,7 @@ void showStatus(const char *line1, const char *line2 = "") {
   }
 }
 
-// Width of s[0..len) in the loaded smooth font (for watch::wrapText).
+// Width of s[0..len) in the current font and text size (for watch::wrapText).
 int measureText(const char *s, size_t len, void *) {
   char buf[256];
   len = min(len, sizeof(buf) - 1);
@@ -688,15 +760,15 @@ int measureText(const char *s, size_t len, void *) {
   return tft.textWidth(buf);
 }
 
-// Word-wraps UTF-8 text (Cyrillic included) into the box x..x+w, y..maxY
-// with one of the smooth fonts; text that does not fit ends in "...".
-// Returns the y below the last line.
-int drawTextBox(const uint8_t *font, const char *text, int x, int y, int w, int maxY,
-                uint16_t color) {
-  tft.loadFont(font);
+// Word-wraps text into the box x..x+w, y..maxY in the built-in 6x8 font
+// scaled by `size`; text that does not fit ends in "...". Returns the y
+// below the last line.
+int drawTextBox(uint8_t size, const char *text, int x, int y, int w, int maxY, uint16_t color) {
+  tft.setTextFont(1);
+  tft.setTextSize(size);
   tft.setTextColor(color, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
-  const int lineH = tft.fontHeight();
+  const int lineH = tft.fontHeight() + 4 * size;
 
   watch::TextSpan lines[12];
   size_t maxLines = lineH > 0 ? max(0, (maxY - y) / lineH) : 0;
@@ -704,7 +776,7 @@ int drawTextBox(const uint8_t *font, const char *text, int x, int y, int w, int 
   bool truncated = false;
   const size_t n = watch::wrapText(text, w, measureText, nullptr, lines, maxLines, &truncated);
 
-  static const char kEllipsis[] = "\xE2\x80\xA6";  // U+2026
+  static const char kEllipsis[] = "...";
   char buf[256];
   for (size_t i = 0; i < n; i++) {
     const char *start = text + lines[i].start;
@@ -717,43 +789,85 @@ int drawTextBox(const uint8_t *font, const char *text, int x, int y, int w, int 
     tft.drawString(buf, x, y);
     y += lineH;
   }
-  tft.unloadFont();
+  tft.setTextSize(1);
   return y;
 }
 
-// How each kind of answer looks and feels.
-struct ReplyStyle { uint16_t color; const char *title; uint8_t haptic; };
+// How each kind of answer looks and feels (ReplyStyle is declared at the top).
 
 ReplyStyle replyStyle(watch::ReplyKind kind) {
   switch (kind) {
-    case watch::ReplyKind::Ok:       return {TFT_GREEN, "OK", HAPTIC_DOUBLE};
-    case watch::ReplyKind::Rejected: return {TFT_ORANGE, "REJECTED", HAPTIC_ALERT};
-    case watch::ReplyKind::Error:    return {TFT_RED, "ERROR", HAPTIC_ALERT};
-    case watch::ReplyKind::Status:   return {TFT_LIGHTGREY, "...", 0};
+    case watch::ReplyKind::Ok:       return {TFT_GREEN, "OK", HAPTIC_DOUBLE, ICON_CHECK};
+    case watch::ReplyKind::Rejected: return {TFT_ORANGE, "REJECTED", HAPTIC_ALERT, ICON_BANG};
+    case watch::ReplyKind::Error:    return {TFT_RED, "ERROR", HAPTIC_ALERT, ICON_CROSS};
+    case watch::ReplyKind::Status:   return {TFT_LIGHTGREY, "...", 0, ICON_DOTS};
     case watch::ReplyKind::Info:     break;
   }
-  return {accent(), "ANSWER", HAPTIC_DOUBLE};
+  return {accent(), "ANSWER", HAPTIC_DOUBLE, ICON_CHECK};
 }
 
-#define REPLY_BAND_H      34
+// A filled, anti-aliased disc in the style's color with the glyph cut out
+// in black: a check mark, a cross, "!" or "...".
+void drawReplyIcon(int cx, int cy, int r, const ReplyStyle &style) {
+  tft.fillSmoothCircle(cx, cy, r, style.color, TFT_BLACK);
+  const float w = max(2.0f, r * 0.24f);   // stroke width
+  const uint16_t ink = TFT_BLACK;
+  switch (style.icon) {
+    case ICON_CHECK:
+      tft.drawWideLine(cx - 0.45f * r, cy + 0.02f * r, cx - 0.12f * r, cy + 0.36f * r, w, ink, style.color);
+      tft.drawWideLine(cx - 0.12f * r, cy + 0.36f * r, cx + 0.46f * r, cy - 0.32f * r, w, ink, style.color);
+      break;
+    case ICON_CROSS:
+      tft.drawWideLine(cx - 0.36f * r, cy - 0.36f * r, cx + 0.36f * r, cy + 0.36f * r, w, ink, style.color);
+      tft.drawWideLine(cx + 0.36f * r, cy - 0.36f * r, cx - 0.36f * r, cy + 0.36f * r, w, ink, style.color);
+      break;
+    case ICON_BANG:
+      tft.drawWideLine(cx, cy - 0.52f * r, cx, cy + 0.10f * r, w, ink, style.color);
+      tft.drawSpot(cx, cy + 0.44f * r, w * 0.6f, ink, style.color);
+      break;
+    case ICON_DOTS:
+      for (int i = -1; i <= 1; i++) tft.drawSpot(cx + i * 0.42f * r, cy, w * 0.55f, ink, style.color);
+      break;
+  }
+}
 
-// The answer screen: a colored band says what kind of answer it is (OK,
-// REJECTED, ERROR), the text below wraps and keeps Cyrillic readable.
+#define REPLY_HEADER_H    50     // icon, label, response time, divider
+
+// The head of the answer screen: icon and label in the answer's color on
+// the left, how long the answer took on the right, a thin rule below.
+// Returns the y below it.
+int drawReplyHeader(int y, const ReplyStyle &style, uint32_t tookMs) {
+  const int cy = y + 22;
+  const int r = 17;
+  drawReplyIcon(TEXT_MARGIN + r, cy, r, style);
+
+  tft.setTextSize(1);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(style.color, TFT_BLACK);
+  tft.drawString(style.title, TEXT_MARGIN + 2 * r + 10, cy + 1, 4);
+
+  if (tookMs) {
+    char took[16];
+    watch::formatDuration(tookMs, took, sizeof(took));
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString(took, SCREEN_W - TEXT_MARGIN, cy + 1, 2);
+  }
+  tft.drawFastHLine(TEXT_MARGIN, y + REPLY_HEADER_H - 6, SCREEN_W - 2 * TEXT_MARGIN, style.color);
+  return y + REPLY_HEADER_H;
+}
+
+// The answer screen: what kind of answer it is (OK, REJECTED, ERROR) and
+// how long it took, then the text, wrapped by word.
 void showServerResponse(const char *response) {
   clearBody();
   drawStatusBar();
   const watch::Reply reply = watch::parseReply(response);
   const ReplyStyle style = replyStyle(reply.kind);
-
-  tft.fillRect(0, BAR_H, SCREEN_W, REPLY_BAND_H, style.color);
-  tft.setTextSize(1);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_BLACK, style.color);
-  tft.drawString(style.title, SCREEN_W / 2, BAR_H + REPLY_BAND_H / 2, 4);
+  const int y = drawReplyHeader(BAR_H + 4, style, lastResponseMs);
 
   const char *body = reply.body[0] ? reply.body : "(no details)";
-  drawTextBox(ui_font_20, body, TEXT_MARGIN, BAR_H + REPLY_BAND_H + 8,
-              SCREEN_W - 2 * TEXT_MARGIN, SCREEN_H - 4, TFT_WHITE);
+  drawTextBox(2, body, TEXT_MARGIN, y, SCREEN_W - 2 * TEXT_MARGIN, SCREEN_H - 4, TFT_WHITE);
 }
 
 void drawClock() {
@@ -811,10 +925,18 @@ void drawMenu() {
     const ReplyStyle style = replyStyle(reply.kind);
     char title[32];
     snprintf(title, sizeof(title), "Last answer: %s", style.title);
-    tft.setTextDatum(TL_DATUM);
+    drawReplyIcon(TEXT_MARGIN + 7, 105, 7, style);
+    tft.setTextDatum(ML_DATUM);
     tft.setTextColor(style.color, TFT_BLACK);
-    tft.drawString(title, TEXT_MARGIN, 98, 2);
-    drawTextBox(ui_font_16, reply.body, TEXT_MARGIN, 116, SCREEN_W - 2 * TEXT_MARGIN,
+    tft.drawString(title, TEXT_MARGIN + 20, 106, 2);
+    if (lastResponseMs) {
+      char took[16];
+      watch::formatDuration(lastResponseMs, took, sizeof(took));
+      tft.setTextDatum(MR_DATUM);
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.drawString(took, SCREEN_W - TEXT_MARGIN, 106, 2);
+    }
+    drawTextBox(1, reply.body, TEXT_MARGIN, 116, SCREEN_W - 2 * TEXT_MARGIN,
                 MENU_BTN_Y - 4, TFT_LIGHTGREY);
   }
 
@@ -824,21 +946,38 @@ void drawMenu() {
   tft.drawString("Settings", cx, MENU_BTN_Y + MENU_BTN_H / 2, 4);
 }
 
+#define WAIT_TIMER_Y      100    // center of the response timer on the waiting screens
+
+// The running response timer, big, in the 7-segment font. Redrawn in place
+// every second (the padding erases the previous value).
+void drawWaitTimer() {
+  if (!commandPending) return;
+  char buf[12];
+  watch::formatTimer(millis() - commandStartedAt, buf, sizeof(buf));
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextPadding(tft.textWidth("8:88:88", 7));
+  tft.drawString(buf, SCREEN_W / 2, WAIT_TIMER_Y, 7);
+  tft.setTextPadding(0);
+}
+
 // The two waiting screens of a command on its way.
 void drawWait(const char *title) {
   clearBody();
   drawStatusBar();
-  int cy = BAR_H + (SCREEN_H - BAR_H) / 2;
   tft.setTextSize(2);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(title, SCREEN_W / 2, cy - 30);
+  tft.drawString(title, SCREEN_W / 2, BAR_H + 22);
   tft.setTextSize(1);
+  drawWaitTimer();
+  tft.setTextDatum(MC_DATUM);
   tft.setTextColor(phoneConnected ? accent() : TFT_ORANGE, TFT_BLACK);
-  tft.drawString(phoneConnected ? "phone connected" : "phone not connected", SCREEN_W / 2, cy - 6, 2);
+  tft.drawString(phoneConnected ? "phone connected" : "phone not connected", SCREEN_W / 2, 146, 2);
   if (waitDetail[0]) {
-    drawTextBox(ui_font_16, waitDetail, TEXT_MARGIN, cy + 12, SCREEN_W - 2 * TEXT_MARGIN,
-                SCREEN_H - 24, TFT_LIGHTGREY);
+    drawTextBox(1, waitDetail, TEXT_MARGIN, 162, SCREEN_W - 2 * TEXT_MARGIN, SCREEN_H - 24,
+                TFT_LIGHTGREY);
   }
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -1047,10 +1186,21 @@ void refreshScreen() {
   }
 }
 
+// Stops the response timer. Returns how long the command took, or 0 if
+// none was on its way (e.g. a late answer to an abandoned command).
+uint32_t finishCommand() {
+  if (!commandPending) return 0;
+  commandPending = false;
+  const uint32_t ms = millis() - commandStartedAt;
+  Serial.printf("response after %lu ms\n", (unsigned long)ms);
+  return ms;
+}
+
 // An error the watch itself detected, shown and remembered like one from
 // the server.
 void showLocalError(const char *what) {
   snprintf(lastResponse, sizeof(lastResponse), "ERROR: %s", what);
+  lastResponseMs = finishCommand();
   Serial.printf("error: %s\n", what);
   buzz(HAPTIC_ALERT);
   enterScreen(SCREEN_RESPONSE);
@@ -1188,6 +1338,8 @@ void stopRecording() {
     delay(1500);
     goToSleep();
   }
+  commandStartedAt = millis();      // the response timer starts here
+  commandPending = true;
   enterScreen(SCREEN_WAIT_PHONE);   // loop() sends as soon as the phone is ready
 }
 
@@ -1500,6 +1652,27 @@ void probeHardware() {
 // USB serial console
 // ---------------------------------------------------------------------
 
+// Raw FT6336 registers for <seconds>, 10 per second, for diagnosing
+// unexpected touch wakes.
+void dumpTouch(uint32_t seconds) {
+  Serial.printf("touch dump: %lu s, INT pin %d\n", (unsigned long)seconds, digitalRead(TOUCH_INT_PIN));
+  const uint32_t start = millis();
+  while (millis() - start < seconds * 1000) {
+    Wire1.beginTransmission(FT6336_ADDR);
+    Wire1.write(0x00);              // DEV_MODE, GEST_ID, TD_STATUS, P1 XH XL YH YL WEIGHT MISC
+    uint8_t r[9] = {};
+    if (Wire1.endTransmission(false) == 0 && Wire1.requestFrom(FT6336_ADDR, 9) == 9) {
+      for (int i = 0; i < 9; i++) r[i] = Wire1.read();
+    }
+    Serial.printf("TOUCH t=%lu int=%d n=%u ev=%u x=%u y=%u weight=%u area=%u\n",
+                  (unsigned long)(millis() - start), digitalRead(TOUCH_INT_PIN), r[2] & 0x0F,
+                  r[3] >> 6, ((r[3] & 0x0F) << 8) | r[4], ((r[5] & 0x0F) << 8) | r[6], r[7],
+                  r[8] >> 4);
+    delay(100);
+  }
+  Serial.println("touch dump done");
+}
+
 void printHelp() {
   Serial.println(
       "Commands:\n"
@@ -1510,6 +1683,9 @@ void printHelp() {
       "  C<0|1>   sleep clock: 0 = RC 136 kHz, 1 = RC_FAST/256 (saved)\n"
       "  N<0|1>   RTC correction on wake: 0 = off (tests, until reset), 1 = on\n"
       "  S        hardware probe: I2C devices, sensors, radio, microphone\n"
+      "  P<sec>   raw touch controller registers for <sec>\n"
+      "  W        UI test: show the waiting screen with the response timer\n"
+      "  A<text>  UI test: an answer from the server, e.g. AOK: lights on\n"
       "  H        this help");
 }
 
@@ -1530,7 +1706,10 @@ void handleCommand(const String &line) {
       break;
     }
     case 'Q': printClockReport(); break;
-    case 'R': printRtcTick(); break;
+    case 'R':
+      serviceRtcWrite(true);        // measure the RTC as set, not as it was
+      printRtcTick();
+      break;
     case 'Z': {
       const long seconds = atol(arg);
       if (seconds < 1 || seconds > 86400) {
@@ -1552,6 +1731,17 @@ void handleCommand(const String &line) {
       Serial.printf("RTC correction on wake: %s\n", rtcResyncDisabled ? "off" : "on");
       break;
     case 'S': probeHardware(); break;
+    case 'W':                       // UI test: a command on its way
+      waitDetail[0] = '\0';
+      commandStartedAt = millis();
+      commandPending = true;
+      enterScreen(SCREEN_WAIT_RESPONSE);
+      Serial.println("waiting screen (send A<text> to answer)");
+      break;
+    case 'A':                       // UI test: an answer from the server
+      handleReply(arg);
+      break;
+    case 'P': dumpTouch(constrain(atol(arg), 1, 60)); break;
     case 'H': printHelp(); break;
     default: Serial.println("unknown command, H for help"); break;
   }
@@ -1832,6 +2022,7 @@ void handleReply(const char *text) {
     return;
   }
   strlcpy(lastResponse, text, sizeof(lastResponse));
+  lastResponseMs = finishCommand();
   // Shown wherever the watch is, except mid-recording and with the screen off.
   if (screen == SCREEN_RECORDING || screen == SCREEN_BG_SYNC) return;
   buzz(replyStyle(reply.kind).haptic);
@@ -1841,6 +2032,7 @@ void handleReply(const char *text) {
 void loop() {
   handleSerial();
   serviceRtcWrite(false);
+  serviceRtcTickLock();
 
   watch::TimeMessage newTime;
   bool timeSynced = false;
@@ -1949,7 +2141,13 @@ void loop() {
     // A command on its way: no timeout into sleep unless the battery is
     // low. The backlight dims while nothing happens; a tap lights it.
     case SCREEN_WAIT_PHONE:
-    case SCREEN_WAIT_RESPONSE:
+    case SCREEN_WAIT_RESPONSE: {
+      static uint32_t shownSecond = UINT32_MAX;
+      const uint32_t second = (millis() - commandStartedAt) / 1000;
+      if (second != shownSecond) {
+        shownSecond = second;
+        drawWaitTimer();
+      }
       if (tap) applyBrightness();
       else if (!backlightDimmed && millis() - litSince > WAIT_DIM_MS) dimBacklight();
 
@@ -1964,6 +2162,7 @@ void loop() {
         showLocalError("No answer yet (battery low). The phone app keeps the result.");
       }
       break;
+    }
 
     case SCREEN_RESPONSE:
       if (tap) screenSince = millis();
@@ -1983,5 +2182,7 @@ void loop() {
       break;
   }
 
-  delay(isRecording ? 1 : 20);
+  // Fast passes while recording, and while waiting for the RTC tick (at
+  // most a second after waking): its moment is caught to within a pass.
+  delay(isRecording || rtcTickLockPending ? 1 : 20);
 }

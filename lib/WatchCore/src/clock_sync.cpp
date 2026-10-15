@@ -94,6 +94,10 @@ int64_t rtcCorrectionUs(int64_t systemUs, int64_t rtcSeconds) {
   return windowStart + kUsPerSecond / 2 - systemUs;
 }
 
+int64_t rtcTickCorrectionUs(int64_t systemUsAtTick, int64_t rtcSecondsAfterTick) {
+  return rtcSecondsAfterTick * kUsPerSecond - systemUsAtTick;
+}
+
 uint32_t secondsUntilBackgroundSync(int64_t now, int64_t lastSync, uint8_t failedAttempts,
                                     const SyncSchedule &schedule) {
   int64_t wait;

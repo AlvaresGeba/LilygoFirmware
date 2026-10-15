@@ -15,7 +15,7 @@ import time
 from clock_drift_test import Watch
 
 # Last line of each command's output.
-DONE = {"S": "end of probe", "H": "this help", "Q": "CLK ", "R": "TICK", "T": "time set"}
+DONE = {"S": "end of probe", "H": "this help", "Q": "CLK ", "R": "TICK", "T": "time set", "P": "touch dump done"}
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
     args = ap.parse_args()
 
     watch = Watch(args.port)
-    watch.connect(timeout=60)
+    watch.attach(timeout=60)
     commands = list(args.commands)
     if args.set_time:
         offset = -(time.altzone if time.localtime().tm_isdst else time.timezone) // 60

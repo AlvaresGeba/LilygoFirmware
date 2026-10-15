@@ -128,6 +128,21 @@ void test_correction_from_unset_clock() {
   TEST_ASSERT_EQUAL_INT64(T * US + 500000, 1234567 + c);
 }
 
+// --- rtcTickCorrectionUs ---------------------------------------------------
+
+void test_tick_correction_on_boundary_is_zero() {
+  TEST_ASSERT_EQUAL_INT64(0, rtcTickCorrectionUs(T * US, T));
+}
+
+void test_tick_correction_pulls_back_a_fast_clock() {
+  // Woke 483 ms fast (the mid-second guess was off): the tick fixes it.
+  TEST_ASSERT_EQUAL_INT64(-483000, rtcTickCorrectionUs(T * US + 483000, T));
+}
+
+void test_tick_correction_pushes_a_slow_clock() {
+  TEST_ASSERT_EQUAL_INT64(250000, rtcTickCorrectionUs((T - 1) * US + 750000, T));
+}
+
 // --- secondsUntilBackgroundSync -------------------------------------------
 
 static const SyncSchedule kDaily = {24 * 3600, 3600, 300};
@@ -175,6 +190,9 @@ int main() {
   RUN_TEST(test_correction_from_unset_clock);
   RUN_TEST(test_schedule_waits_for_interval_after_success);
   RUN_TEST(test_schedule_overdue_sync_uses_minimum_delay);
+  RUN_TEST(test_tick_correction_on_boundary_is_zero);
+  RUN_TEST(test_tick_correction_pulls_back_a_fast_clock);
+  RUN_TEST(test_tick_correction_pushes_a_slow_clock);
   RUN_TEST(test_schedule_backs_off_after_failures);
   RUN_TEST(test_schedule_never_synced_tries_soon);
   RUN_TEST(test_schedule_clock_moved_before_last_sync);

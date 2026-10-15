@@ -26,6 +26,7 @@ import glob
 import re
 import statistics
 import sys
+import termios
 import time
 
 import serial
@@ -52,10 +53,13 @@ class Watch:
                     ser.port = ports[0]
                     ser.baudrate = 115200
                     ser.timeout = 0.05
-                    # DTR/RTS low: on the S3's USB-Serial-JTAG some line
-                    # transitions reset the chip, which would lose the clock.
-                    ser.dtr = False
-                    ser.rts = False
+                    # The S3's USB-Serial-JTAG resets the chip when RTS is
+                    # set while DTR is clear. The kernel raises both on open;
+                    # pyserial then applies DTR before RTS, so asking for
+                    # both low passes through DTR=0/RTS=1 and resets the
+                    # watch. Keep both high: no transition at all.
+                    ser.dtr = True
+                    ser.rts = True
                     ser.open()
                     self.ser = ser
                     time.sleep(0.3)
@@ -65,6 +69,26 @@ class Watch:
                     pass  # udev not done yet
             time.sleep(0.1)
         raise TimeoutError(f"no watch on {self.port_glob} after {timeout:.0f} s - is it awake?")
+
+    def attach(self, timeout):
+        """Connects and makes sure the watch answers.
+
+        The watch may be just falling asleep when the port is opened (the
+        clock screen sleeps after a few seconds): the first write then fails
+        or goes unanswered. Each console command keeps it awake, so once a
+        "Q" is answered the session holds. Retries until `timeout`.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self.connect(timeout=max(1.0, deadline - time.monotonic()))
+                self.command("Q", CLK_RE.pattern)
+                return
+            except (serial.SerialException, OSError, termios.error, TimeoutError):
+                self.close()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"the watch on {self.port_glob} does not answer - tap it")
+                time.sleep(0.5)
 
     def close(self):
         if self.ser:
@@ -85,7 +109,9 @@ class Watch:
         deadline = time.monotonic() + timeout
         buf = b""
         while time.monotonic() < deadline:
-            chunk = self.ser.read(256)
+            # Whatever is there, or block for one byte: a fixed-size read would
+            # wait out the timeout and misdate the line by up to 50 ms.
+            chunk = self.ser.read(self.ser.in_waiting or 1)
             arrived = time.time()
             if not chunk:
                 continue
@@ -170,6 +196,9 @@ def run_mode(watch, mode, cycles, sleep_s, tz, rows, resync):
     for i in range(1, cycles + 1):
         watch.sleep(sleep_s)
         watch.wake(sleep_s)
+        # Within a second of waking the firmware steps the clock onto the
+        # RTC's next tick (with the correction on): measure after that.
+        time.sleep(1.2)
         c = watch.clock()
         elapsed = time.time() - start
         points.append((elapsed, c["sys_err_ms"]))
@@ -187,7 +216,7 @@ def main():
     ap.add_argument("--cycles", type=int, default=6)
     ap.add_argument("--sleep", type=int, default=60, help="seconds per deep sleep")
     ap.add_argument("--modes", default="0,1", help="sleep clocks to measure raw: 0=rc136k, 1=rcfast256")
-    ap.add_argument("--final-mode", default="1", help="sleep clock for the end-to-end run")
+    ap.add_argument("--final-mode", default="0", help="sleep clock for the end-to-end run")
     ap.add_argument("--tz", type=int, default=None, help="UTC offset (minutes) to leave on the watch")
     ap.add_argument("--csv", help="write every measurement here")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -196,7 +225,7 @@ def main():
     tz = args.tz if args.tz is not None else round(-time.timezone / 60 if not time.localtime().tm_isdst
                                                   else -time.altzone / 60)
     watch = Watch(args.port, args.verbose)
-    watch.connect(timeout=60)
+    watch.attach(timeout=150)  # may be in a test sleep from an earlier run
     rows = []
     results = {}
     try:

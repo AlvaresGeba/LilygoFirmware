@@ -48,6 +48,12 @@ bool parseTimeMessage(const char *text, size_t len, TimeMessage &out);
 // the middle of the window, which halves the worst-case error.
 int64_t rtcCorrectionUs(int64_t systemUs, int64_t rtcSeconds);
 
+// The finer step, once the watch has seen the PCF8563's seconds register
+// change: that moment is the start of second `rtcSecondsAfterTick`. Returns
+// how many microseconds to add to the system clock, which read `systemUsAtTick`
+// right then, to put it exactly on that boundary.
+int64_t rtcTickCorrectionUs(int64_t systemUsAtTick, int64_t rtcSecondsAfterTick);
+
 struct SyncSchedule {
   uint32_t intervalS;    // a successful sync is trusted for this long
   uint32_t firstRetryS;  // after a failed attempt; doubled per failure, capped at intervalS
