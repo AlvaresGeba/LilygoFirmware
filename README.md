@@ -30,9 +30,13 @@ phone app's job.
 - **Never gives up on a command**: while a command is on its way the watch
   stays awake until the answer or an error arrives (the backlight dims after
   30 s). Only on battery below 30 % does it fall back to timeouts.
-- **Deep sleep** between uses; wakes on a tap or the side button.
+- **Deep sleep** between uses; wakes on a tap, the side button or a raised
+  wrist.
+- **Raise to wake**: turning the wrist to look at the watch shows the clock
+  for 4 s; touching the watch or pressing the button keeps it on as usual.
+  See [Raise to wake](#raise-to-wake).
 - **Settings** stored in flash: brightness (5–100 %), interface color, screen
-  timeout, vibration, 180° screen rotation.
+  timeout, vibration, 180° screen rotation, raise to wake.
 - **Haptic feedback** through the built-in DRV2605 motor driver.
 - **Accurate clock**: the PCF8563 RTC (quartz) is the reference and is
   checked on every wake; the phone sets it on every connect, and once a day
@@ -52,6 +56,7 @@ Pins follow LILYGO's
 | FT6336 touch | taps, sliders, wake from sleep | I2C on 39/40, INT 16 |
 | AXP2101 PMU | power rails, side button, battery | I2C on 10/11, IRQ 21 |
 | PCF8563 RTC | keeps time across power loss | I2C on 10/11 |
+| BMA423 accelerometer | raise to wake (wrist-tilt gesture) | I2C on 10/11, INT1 14 |
 | DRV2605 | vibration | I2C on 10/11, powered from BLDO2 |
 | PDM microphone | voice recording | clock 44, data 47 |
 
@@ -65,21 +70,23 @@ T-Watch S3 it is a plain push button with no rotary encoder (LilyGoLib reports
 | Action | Result |
 |---|---|
 | Tap the screen (asleep) | Wake and show the clock |
+| Raise the wrist (asleep) | Show the clock for 4 s; a touch or a press keeps the watch awake |
 | Tap while the clock is shown | Info screen: phone link, last server answer, **Settings** button |
 | Side button, single press | Sleep (or wake, when asleep) |
 | Side button, double press | Start recording, also straight from sleep |
 | Side button, single press while recording | Stop and send |
 | Side button, held 4 s or longer | Power off (the PMU does this, whatever the firmware is doing) |
 
-The watch goes back to sleep on its own: after the screen timeout on the clock,
-15 s on the info screen, 20 s in settings, and 10 s after showing an answer.
+The watch goes back to sleep on its own: after the screen timeout on the clock
+(4 s after a raised wrist, unless touched), 15 s on the info screen, 20 s in settings, and 10 s after showing an answer.
 It does not time out while a command is being delivered (waiting for the
 phone, sending, waiting for the server), unless the battery is below 30 %
 and not charging; then it waits 20 s for the phone and 60 s for the answer.
 A single press cancels the wait at any time.
 
 In **Settings**, tap *Brightness*, *Color* or *Sleep after* to open a slider and
-drag a finger along it; tap *Vibration* or *Rotate* to toggle them.
+drag a finger along it; tap *Vibration*, *Rotate* or *Raise to wake* to toggle
+them.
 
 ## BLE protocol
 
@@ -153,6 +160,7 @@ per line); `H` lists them:
 | `N<0\|1>` | RTC correction on wake off/on (tests; off lasts until reset) |
 | `S` | hardware probe: I2C devices, sensors, radio, GPS, microphone |
 | `P<sec>` | raw touch controller registers for <sec> seconds (diagnosing touch wakes) |
+| `G` | raise to wake: setting, BMA423 state, INT1 level, how the tilt wakes since power-on ended |
 | `W` | UI test: the waiting screen with the response timer running |
 | `A<text>` | UI test: an answer from the server, e.g. `AOK: lights on`, `AERROR: timeout` |
 
@@ -204,6 +212,38 @@ computer's NTP-synced clock: the drift of both sleep clocks with the
 correction off, the PCF8563's drift, and the end-to-end error with the
 correction on.
 
+## Raise to wake
+
+The BMA423's feature engine recognizes the wrist-tilt gesture and raises its
+INT1 line (GPIO 14). The ESP32-S3 has no pin wake left for it: ext0 watches
+the touch line, ext1 the PMU's, and ext1 on the S3 can only wake when *all*
+its pins are low, so GPIO 14 cannot simply join it. Instead the ULP
+coprocessor (the FSM) runs a six-instruction program every 100 ms during deep
+sleep: if INT1 is high, it wakes the CPU (wake cause `ESP_SLEEP_WAKEUP_ULP`).
+The Arduino core reserves no RTC memory for the ULP, so the program is built
+with the IDF's `ulp.h` macros and copied into an `RTC_DATA_ATTR` array by
+hand.
+
+- INT1 is push-pull, active high and **latched**: it stays high until the
+  firmware reads the interrupt status, so a 100 ms poll misses nothing. The
+  status is read on every boot and again right before sleeping; if the line
+  is still high then, the ULP is not armed (it would wake the watch at once).
+- After a tilt wake the clock stays up for 4 s unless the watch is touched or
+  the button is pressed. If the watch hangs vertically (arm down, screen tilted
+  less than ~24° from vertical) it goes back to sleep without lighting the
+  screen.
+- Three tilt wakes in a row without a tilt event in the chip's status pause
+  raise to wake until the next wake by touch or button (guard against a
+  stuck or noisy line).
+- The BMA423 stays powered and configured through deep sleep (low-power mode,
+  50 Hz). Its 6 KB feature config (Bosch, via SensorLib) is uploaded again
+  only when the chip has lost it. The axis remap follows the *Rotate*
+  setting.
+- With the setting off the accelerometer is suspended and the ULP is not
+  started.
+- Cost: roughly 20–40 µA extra in deep sleep (accelerometer in low-power
+  mode plus the ULP's polls), and about 4 s of screen time per false gesture.
+
 ## Tests
 
 ```sh
@@ -235,6 +275,7 @@ tools/clock_drift_test.py --cycles 6 --sleep 60   # on the watch (awake, plugged
 │   ├── clock_sync.*             # TIME parsing, RTC correction, background sync schedule
 │   ├── server_reply.*           # OK/REJECTED/ERROR/progress, safe UTF-8 copy
 │   ├── power_policy.h           # when the watch may time out / sync in the background
+│   ├── wrist_wake.h             # raise to wake: tilt-wake timeout, orientation check, loop guard
 │   ├── text_wrap.*              # word wrap by pixel width, UTF-8 aware
 │   └── time_format.*            # response timer and duration text
 ├── test/                        # Unity tests for lib/WatchCore (pio test -e native)

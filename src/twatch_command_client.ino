@@ -21,9 +21,15 @@
   the error always reaches the screen; only on battery below 30 % the old
   timeouts apply. A single press still cancels and sleeps.
 
+  Raise to wake: the BMA423's wrist-tilt gesture wakes the watch too. Both
+  ext0 (touch) and ext1 (button) are taken, so the ULP coprocessor polls the
+  accelerometer's INT1 line during deep sleep and wakes the CPU. A tilt wake
+  shows the clock for only 4 s unless the watch is touched or the button is
+  pressed; wakes with the arm hanging down go straight back to sleep.
+
   The status menu has a Settings button at the bottom: brightness (5-100%),
-  interface color and sleep timeout are set with a touch slider; vibration
-  and screen rotation toggle on tap. (The crown only clicks: on T-Watch S3
+  interface color and sleep timeout are set with a touch slider; vibration,
+  screen rotation and raise to wake toggle on tap. (The crown only clicks: on T-Watch S3
   it has no rotary encoder - LilyGoLib marks hasRotary = false.)
   Settings live in NVS. Every screen has a status bar on top with the
   time, the phone link and the battery level.
@@ -51,7 +57,8 @@
 
   Build with PlatformIO: `pio run -t upload` in the repository root
   (platformio.ini pins the platform, libraries and the TFT_eSPI setup).
-  Libraries: NimBLE-Arduino 1.4.x, TFT_eSPI, XPowersLib; lib/WatchCore holds
+  Libraries: NimBLE-Arduino 1.4.x, TFT_eSPI, XPowersLib, SensorLib (BMA423
+  feature engine); lib/WatchCore holds
   the hardware-independent logic (unit tests: `pio test -e native`).
 
   Pin numbers follow LilyGO's TTGO_TWatch_Library src/utilities.h,
@@ -66,17 +73,22 @@
 #include <driver/rtc_io.h>
 #include <esp_private/esp_clk.h>
 #include <esp_sleep.h>
+#include <esp32s3/ulp.h>
 #include <soc/rtc.h>
+#include <soc/rtc_cntl_reg.h>
+#include <soc/rtc_io_reg.h>
 #include <sys/time.h>
 
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
+#include <SensorBMA423.hpp>
 
 #include "clock_sync.h"
 #include "power_policy.h"
 #include "server_reply.h"
 #include "text_wrap.h"
 #include "time_format.h"
+#include "wrist_wake.h"
 
 // ---------------------------------------------------------------------
 // Hardware pins (TTGO_TWatch_Library utilities.h, USING_TWATCH_S3)
@@ -93,7 +105,7 @@
 #define MIC_CLOCK_PIN     44    // PDM clock
 #define MIC_DATA_PIN      47    // PDM data
 #define RTC_INT_PIN       17    // PCF8563 alarm/timer output (unused)
-#define BMA423_INT_PIN    14    // accelerometer INT1 (unused)
+#define BMA423_INT_PIN    14    // accelerometer INT1: raise to wake, polled by the ULP in deep sleep
 
 // SX1262 LoRa radio (powered from ALDO4) and the GPS of the Plus model
 // (DC3): both are off; the hardware probe switches them on briefly.
@@ -174,8 +186,8 @@ enum SleepClock : uint8_t { SLEEP_CLOCK_RC136K = 0, SLEEP_CLOCK_RCFAST_D256 = 1 
 #define SCREEN_H          240
 #define BAR_H             24     // status bar
 #define ROW_Y0            BAR_H  // settings rows
-#define ROW_H             36
-#define SETTINGS_ROWS     5
+#define ROW_H             30
+#define SETTINGS_ROWS     6
 #define BACK_Y            (ROW_Y0 + SETTINGS_ROWS * ROW_H)
 #define TEXT_MARGIN       10
 
@@ -282,6 +294,7 @@ struct Settings {
   uint8_t sleepAfter;   // index into SLEEP_SECONDS
   bool vibration;
   bool flipped;         // screen rotated 180 degrees
+  bool raiseToWake;     // wrist tilt wakes the watch (BMA423 + ULP)
   SleepClock sleepClock;
 } cfg;
 
@@ -294,6 +307,7 @@ void loadSettings() {
   cfg.sleepAfter = min<uint8_t>(prefs.getUChar("sleep", 1), SLEEP_OPTIONS - 1);
   cfg.vibration = prefs.getBool("vibro", true);
   cfg.flipped = prefs.getBool("flip", false);
+  cfg.raiseToWake = prefs.getBool("raise", true);
   cfg.sleepClock = prefs.getUChar("slowclk", SLEEP_CLOCK_DEFAULT) == SLEEP_CLOCK_RC136K
                        ? SLEEP_CLOCK_RC136K : SLEEP_CLOCK_RCFAST_D256;
 }
@@ -304,6 +318,7 @@ void saveSettings() {
   prefs.putUChar("sleep", cfg.sleepAfter);
   prefs.putBool("vibro", cfg.vibration);
   prefs.putBool("flip", cfg.flipped);
+  prefs.putBool("raise", cfg.raiseToWake);
 }
 
 void applyBrightness() {
@@ -986,7 +1001,7 @@ void drawWait(const char *title) {
 
 // ---------------------------------------------------------------------
 // Settings screen: a list of settings, Back at the bottom (returns to the
-// status menu). Tapping Vibration or Rotate flips it; tapping Brightness,
+// status menu). Tapping Vibration, Rotate or Raise to wake flips it; tapping Brightness,
 // Color or Sleep after opens SCREEN_EDIT, where the value follows a finger
 // dragged along a slider.
 // ---------------------------------------------------------------------
@@ -996,8 +1011,10 @@ void drawWait(const char *title) {
 #define ROW_SLEEP         2
 #define ROW_VIBRATION     3
 #define ROW_ROTATE        4
+#define ROW_RAISE         5
 
-static const char *SETTING_LABELS[SETTINGS_ROWS] = {"Brightness", "Color", "Sleep after", "Vibration", "Rotate"};
+static const char *SETTING_LABELS[SETTINGS_ROWS] = {"Brightness", "Color", "Sleep after", "Vibration",
+                                                    "Rotate", "Raise to wake"};
 
 bool rowHasSlider(int row) { return row == ROW_BRIGHTNESS || row == ROW_COLOR || row == ROW_SLEEP; }
 
@@ -1008,6 +1025,7 @@ void settingValue(int row, char *buf, size_t len) {
     case ROW_SLEEP:      snprintf(buf, len, "%ds", SLEEP_SECONDS[cfg.sleepAfter]); break;
     case ROW_VIBRATION:  snprintf(buf, len, "%s", cfg.vibration ? "On" : "Off"); break;
     case ROW_ROTATE:     snprintf(buf, len, "%s", cfg.flipped ? "180" : "0"); break;
+    case ROW_RAISE:      snprintf(buf, len, "%s", cfg.raiseToWake ? "On" : "Off"); break;
   }
 }
 
@@ -1060,6 +1078,12 @@ int settingsTap(int16_t x, int16_t y) {
     cfg.flipped = !cfg.flipped;
     tft.setRotation(cfg.flipped ? 2 : 0);
     drawSettings();                 // rotation changes everything
+    if (cfg.raiseToWake) setupRaiseToWake();  // the wrist gesture follows the rotation
+  } else if (row == ROW_RAISE) {
+    cfg.raiseToWake = !cfg.raiseToWake;
+    if (cfg.raiseToWake) setupRaiseToWake();
+    else suspendAccel();
+    drawSettingsRow(row);
   }
   saveSettings();
   return -1;
@@ -1442,6 +1466,250 @@ bool sendBufferOverBle(const uint8_t *data, size_t length) {
 }
 
 // ---------------------------------------------------------------------
+// Raise to wake: BMA423 wrist tilt, watched by the ULP in deep sleep
+// ---------------------------------------------------------------------
+// The BMA423's feature engine recognizes the wrist-tilt gesture and raises
+// INT1 (GPIO 14). Deep sleep has no pin wake left for it: ext0 is the
+// touch line, and ext1 on the S3 only knows "all pins low" or "any pin
+// high", so GPIO 14 cannot join the PMU line there. Instead the ULP
+// coprocessor (the FSM) polls GPIO 14 every ULP_POLL_MS and wakes the CPU;
+// setup() sees ESP_SLEEP_WAKEUP_ULP.
+//
+// The BMA423 sits on the always-on 3.3 V rail and keeps running through
+// deep sleep. After a wake it is only checked; its ~6 KB feature config is
+// uploaded again (SensorLib's begin(), ~200 ms) only if the chip lost it.
+
+#define BMA_REG_INT_STAT_0     0x1C   // feature interrupts, then 0x1D; reading clears the latch
+#define BMA_REG_ACC_X_LSB      0x12
+#define BMA_REG_INTERNAL_STAT  0x2A   // bits 0-4 = 0x01: feature config loaded and running
+#define BMA_REG_ACC_RANGE      0x41
+#define BMA_REG_INT_LATCH      0x55
+#define BMA_REG_INT1_MAP       0x56
+#define BMA_REG_PWR_CONF       0x7C   // bit 0: advanced power save
+#define BMA_REG_PWR_CTRL       0x7D   // bit 2: accelerometer on
+#define BMA_INT_WRIST_TILT     0x08   // INT_STAT_0 bit of the wrist-tilt feature
+
+#define ULP_POLL_MS            100    // INT1 is latched, so a slow poll misses nothing
+
+SensorBMA423 accel;
+
+// How the BMA423 is set up; survives deep sleep so a wake can skip the
+// setup. NONE also after power-on: the chip may still run an old setup.
+enum AccelConfig : uint8_t { ACCEL_CFG_NONE, ACCEL_CFG_TILT, ACCEL_CFG_TILT_FLIPPED };
+RTC_DATA_ATTR uint8_t accelConfig = ACCEL_CFG_NONE;
+RTC_DATA_ATTR uint8_t phantomTiltWakes = 0;     // see watch::nextPhantomTiltWakes
+
+// Diagnostics (console "G"), reset on power-on: how tilt wakes ended.
+struct TiltStats { uint16_t wakes, shown, armDown, phantom, expired, used; };
+RTC_DATA_ATTR TiltStats tiltStats = {};
+
+bool tiltWakeUntouched = false;     // woke by a wrist tilt, nobody touched the watch since
+
+// The ULP program lives in RTC slow memory, where the linker puts every
+// RTC_DATA_ATTR variable. The Arduino core reserves no ULP area there
+// (CONFIG_ULP_COPROC_RESERVE_MEM = 0), so ulp_process_macros_and_load()
+// rejects any program: it is copied in by hand, and its branches are plain
+// relative offsets instead of labels.
+RTC_DATA_ATTR uint32_t ulpProgram[8];
+
+void bmaWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(BMA423_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+uint8_t bmaRead(uint8_t reg) { return i2cRead8(Wire, BMA423_ADDR, reg); }
+
+// Reads, and so clears, the latched feature interrupts; INT1 drops.
+uint8_t takeAccelIrq() {
+  Wire.beginTransmission(BMA423_ADDR);
+  Wire.write(BMA_REG_INT_STAT_0);
+  if (Wire.endTransmission(false) != 0) return 0;
+  if (Wire.requestFrom((uint8_t)BMA423_ADDR, (uint8_t)2) != 2) return 0;
+  const uint8_t features = Wire.read();
+  Wire.read();                      // INT_STAT_1: data ready etc., unused
+  return features;
+}
+
+// Sets the BMA423 up for wrist-tilt detection, or checks that it still is.
+// INT1 is push-pull, active high and latched (high until INT_STAT is read):
+// what the ULP program polls for, and a short gesture pulse cannot slip
+// between two polls. The wrist gesture depends on how the watch is worn,
+// so the axis remap follows the screen rotation: rotation 2 is LilyGO's
+// default orientation, with the chip on the bottom layer, bottom-left
+// corner (LilyGoLib); rotation 0 turns it by 180 degrees.
+bool setupRaiseToWake() {
+  const uint8_t want = cfg.flipped ? ACCEL_CFG_TILT_FLIPPED : ACCEL_CFG_TILT;
+  if (accelConfig == want && (bmaRead(BMA_REG_INTERNAL_STAT) & 0x1F) == 0x01) return true;
+
+  const uint32_t started = millis();
+  accelConfig = ACCEL_CFG_NONE;
+  if (!accel.begin(Wire, BMA423_ADDR)) {   // uploads the feature config unless loaded
+    Serial.println("raise to wake: BMA423 not ready");
+    return false;
+  }
+  // Advanced power save off while configuring: with it on, writes need
+  // 450 us gaps, and SensorLib writes back to back.
+  bmaWrite(BMA_REG_PWR_CONF, 0x00);
+  delay(1);
+  // Low-power mode, 50 Hz: the slowest rate the feature engine accepts.
+  accel.configAccelerometer(SensorBMA423::RANGE_4G, SensorBMA423::ODR_50HZ,
+                            SensorBMA423::BW_NORMAL_AVG4, SensorBMA423::PERF_CIC_AVG_MODE);
+  accel.enableAccelerometer();
+  accel.enableFeature(SensorBMA423::FEATURE_TILT, true);
+  accel.setRemapAxes(cfg.flipped ? SensorBMA423::REMAP_BOTTOM_LAYER_BOTTOM_LEFT_CORNER
+                                 : SensorBMA423::REMAP_BOTTOM_LAYER_TOP_RIGHT_CORNER);
+  // INT1: output, push-pull, active high (SensorLib's defaults; the
+  // constants themselves are protected in SensorBMA423).
+  accel.configInterrupt();
+  bmaWrite(BMA_REG_INT_LATCH, 0x01);
+  delay(1);
+  accel.enableTiltIRQ();
+  takeAccelIrq();
+  delay(1);
+  bmaWrite(BMA_REG_PWR_CONF, 0x01);  // advanced power save: sleeps between samples
+
+  const uint8_t status = bmaRead(BMA_REG_INTERNAL_STAT);
+  Serial.printf("raise to wake: BMA423 set up in %lu ms, internal status 0x%02X\n",
+                (unsigned long)(millis() - started), status);
+  if ((status & 0x1F) != 0x01) return false;
+  accelConfig = want;
+  return true;
+}
+
+// Raise to wake off: interrupt unmapped, accelerometer off, chip in
+// suspend. The feature config stays loaded for when it is switched on.
+void suspendAccel() {
+  bmaWrite(BMA_REG_PWR_CONF, 0x00);
+  delay(1);
+  bmaWrite(BMA_REG_INT1_MAP, 0x00);
+  delay(1);
+  bmaWrite(BMA_REG_PWR_CTRL, 0x00);
+  delay(1);
+  takeAccelIrq();
+  bmaWrite(BMA_REG_PWR_CONF, 0x03);  // advanced power save + FIFO self wake-up, as after reset
+  accelConfig = ACCEL_CFG_NONE;
+}
+
+// Acceleration in milli-g, the mean of three samples (50 Hz: 20 ms apart).
+// Chip axes: z is normal to the board, so to the screen.
+bool readAccelMg(int &x, int &y, int &z) {
+  const int lsbPerG = 1024 >> (bmaRead(BMA_REG_ACC_RANGE) & 0x03);  // 12 bit over +-2/4/8/16 g
+  long sum[3] = {0, 0, 0};
+  for (int n = 0; n < 3; n++) {
+    if (n) delay(20);
+    Wire.beginTransmission(BMA423_ADDR);
+    Wire.write(BMA_REG_ACC_X_LSB);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((uint8_t)BMA423_ADDR, (uint8_t)6) != 6) return false;
+    for (int i = 0; i < 3; i++) {
+      const uint8_t lo = Wire.read(), hi = Wire.read();
+      sum[i] += (int16_t)((hi << 8) | lo) >> 4;  // 12 bit, left-justified
+    }
+  }
+  x = sum[0] * 1000 / (3 * lsbPerG);
+  y = sum[1] * 1000 / (3 * lsbPerG);
+  z = sum[2] * 1000 / (3 * lsbPerG);
+  return true;
+}
+
+// GPIO 14 as an RTC input, the way the ULP reads it. The pull-down holds
+// the line low should the chip ever release it; INT1 is push-pull, so it
+// costs nothing while the line is low.
+int accelIntLevel() {
+  const gpio_num_t pin = (gpio_num_t)BMA423_INT_PIN;
+  rtc_gpio_init(pin);
+  rtc_gpio_set_direction(pin, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pullup_dis(pin);
+  rtc_gpio_pulldown_en(pin);
+  return rtc_gpio_get_level(pin);
+}
+
+// Once per boot, before the backlight comes on. Clears the interrupt that
+// woke us and sets the chip up (or checks it, or suspends it). Returns
+// false if a tilt wake found the arm hanging down: back to sleep, dark.
+bool raiseToWakeAtBoot(esp_sleep_wakeup_cause_t wake) {
+  const bool tiltWake = wake == ESP_SLEEP_WAKEUP_ULP;
+  const uint8_t irq = takeAccelIrq();
+  const watch::WakeSource source = tiltWake ? watch::WakeSource::Tilt
+                                   : wake == ESP_SLEEP_WAKEUP_TIMER ? watch::WakeSource::Timer
+                                                                    : watch::WakeSource::User;
+  phantomTiltWakes = watch::nextPhantomTiltWakes(phantomTiltWakes, source, irq & BMA_INT_WRIST_TILT);
+
+  if (!cfg.raiseToWake) {
+    if (accelConfig != ACCEL_CFG_NONE || wake == ESP_SLEEP_WAKEUP_UNDEFINED) suspendAccel();
+    return true;
+  }
+  setupRaiseToWake();
+  if (!tiltWake) return true;
+
+  tiltStats.wakes++;
+  if (!(irq & BMA_INT_WRIST_TILT)) tiltStats.phantom++;
+  int x = 0, y = 0, z = 0;
+  const bool facing = !readAccelMg(x, y, z) || watch::tiltWakeFacesUser(x, y, z);
+  if (facing) tiltStats.shown++;
+  else tiltStats.armDown++;
+  Serial.printf("raise to wake: INT 0x%02X, accel %d %d %d mg, %s\n", irq, x, y, z,
+                facing ? "clock shown" : "arm down, back to sleep");
+  return facing;
+}
+
+// Before sleeping: whether to arm the ULP. Releases a latch left by a
+// tilt while awake, and refuses a line that stays high (it would wake the
+// watch at once, over and over).
+bool raiseToWakeReady() {
+  if (!cfg.raiseToWake || accelConfig == ACCEL_CFG_NONE) return false;
+  if (!watch::raiseToWakeMayArm(phantomTiltWakes)) {
+    Serial.printf("sleep: raise to wake paused, %u wakes without a tilt\n", phantomTiltWakes);
+    return false;
+  }
+  takeAccelIrq();
+  if (accelIntLevel()) {
+    Serial.println("sleep: raise to wake off, INT1 stuck high");
+    return false;
+  }
+  return true;
+}
+
+// Loads the ULP program and starts it. Called after prepareSleepClock():
+// ulp_set_wakeup_period() converts the period with the current sleep clock.
+// The ULP keeps running after it woke the CPU; setup() stops it.
+bool startRaiseToWakeUlp() {
+  const ulp_insn_t program[] = {
+      // R0 = INT1
+      I_RD_REG(RTC_GPIO_IN_REG, RTC_GPIO_IN_NEXT_S + BMA423_INT_PIN, RTC_GPIO_IN_NEXT_S + BMA423_INT_PIN),
+      I_BL(4, 1),                   // low: nothing happened, to HALT
+      // R0 = the RTC is in sleep and can take a wake-up
+      I_RD_REG(RTC_CNTL_LOW_POWER_ST_REG, RTC_CNTL_RDY_FOR_WAKEUP_S, RTC_CNTL_RDY_FOR_WAKEUP_S),
+      I_BL(2, 1),                   // not yet (still going to sleep): next poll, to HALT
+      I_WAKE(),
+      I_HALT(),                     // the ULP timer starts the program again
+  };
+  static_assert(sizeof(program) <= sizeof(ulpProgram), "ULP program does not fit");
+  const uintptr_t at = (uintptr_t)ulpProgram;
+  if (at < SOC_RTC_DATA_LOW || at + sizeof(program) > SOC_RTC_DATA_HIGH) {
+    Serial.println("sleep: raise to wake off, ULP program not in RTC slow memory");
+    return false;
+  }
+  memcpy(ulpProgram, program, sizeof(program));
+  if (ulp_set_wakeup_period(0, ULP_POLL_MS * 1000) != ESP_OK || esp_sleep_enable_ulp_wakeup() != ESP_OK ||
+      ulp_run((at - SOC_RTC_DATA_LOW) / sizeof(uint32_t)) != ESP_OK) {
+    Serial.println("sleep: raise to wake off, ULP did not start");
+    return false;
+  }
+  return true;
+}
+
+void printTiltReport() {
+  Serial.printf("RAISE setting=%d config=%u internal=0x%02X int1=%d phantom_streak=%u "
+                "wakes=%u shown=%u arm_down=%u no_tilt=%u expired=%u used=%u\n",
+                cfg.raiseToWake, accelConfig, bmaRead(BMA_REG_INTERNAL_STAT), accelIntLevel(),
+                phantomTiltWakes, tiltStats.wakes, tiltStats.shown, tiltStats.armDown,
+                tiltStats.phantom, tiltStats.expired, tiltStats.used);
+}
+
+// ---------------------------------------------------------------------
 // Hardware probe (console "S"): what is fitted and alive on this watch
 // ---------------------------------------------------------------------
 
@@ -1492,8 +1760,14 @@ void probeBma423() {
   const int8_t temp = (int8_t)i2cRead8(Wire, BMA423_ADDR, 0x22);
   Serial.printf("  accel x=%.2f y=%.2f z=%.2f g, temperature %d C\n", a[0] / lsbPerG,
                 a[1] / lsbPerG, a[2] / lsbPerG, temp + 23);
-  Wire.beginTransmission(BMA423_ADDR); Wire.write(0x7D); Wire.write(0x00); Wire.endTransmission();
-  Wire.beginTransmission(BMA423_ADDR); Wire.write(0x7C); Wire.write(0x03); Wire.endTransmission();
+  // Back to suspend, or to the raise-to-wake setup this probe disturbed.
+  accelConfig = ACCEL_CFG_NONE;
+  if (cfg.raiseToWake) {
+    setupRaiseToWake();
+  } else {
+    Wire.beginTransmission(BMA423_ADDR); Wire.write(0x7D); Wire.write(0x00); Wire.endTransmission();
+    Wire.beginTransmission(BMA423_ADDR); Wire.write(0x7C); Wire.write(0x03); Wire.endTransmission();
+  }
 }
 
 void probePmu() {
@@ -1684,6 +1958,7 @@ void printHelp() {
       "  N<0|1>   RTC correction on wake: 0 = off (tests, until reset), 1 = on\n"
       "  S        hardware probe: I2C devices, sensors, radio, microphone\n"
       "  P<sec>   raw touch controller registers for <sec>\n"
+      "  G        raise to wake: setting, BMA423 state, INT1 level, tilt wake counters\n"
       "  W        UI test: show the waiting screen with the response timer\n"
       "  A<text>  UI test: an answer from the server, e.g. AOK: lights on\n"
       "  H        this help");
@@ -1742,6 +2017,7 @@ void handleCommand(const String &line) {
       handleReply(arg);
       break;
     case 'P': dumpTouch(constrain(atol(arg), 1, 60)); break;
+    case 'G': printTiltReport(); break;
     case 'H': printHelp(); break;
     default: Serial.println("unknown command, H for help"); break;
   }
@@ -1915,7 +2191,13 @@ void goToSleep() {
   rtc_gpio_pulldown_dis((gpio_num_t)TOUCH_INT_PIN);
   rtc_gpio_pullup_en((gpio_num_t)PMU_IRQ_PIN);
   rtc_gpio_pulldown_dis((gpio_num_t)PMU_IRQ_PIN);
-  prepareSleepClock();              // last: the calibration should be fresh
+  const bool raiseToWake = raiseToWakeReady();
+  prepareSleepClock();              // the calibration should be fresh
+  // Third wake source: the ULP polling the accelerometer (needs the
+  // calibration above).
+  if (raiseToWake && startRaiseToWakeUlp()) {
+    Serial.printf("sleep: raise to wake armed, INT1 polled every %d ms\n", ULP_POLL_MS);
+  }
 
   // No Serial.flush() here: with USB plugged in but no terminal reading,
   // it never returns and the watch hangs with the screen already off.
@@ -1932,6 +2214,7 @@ void wakeFromBackground() {
 void setup() {
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   const bool backgroundSync = wake == ESP_SLEEP_WAKEUP_TIMER && wakePlan == WAKE_PLAN_SYNC;
+  ulp_timer_stop();                 // raise to wake: the ULP keeps polling after it woke us
 
   Serial.begin(115200);
   // USB CDC log is best-effort: drop output instead of blocking when no
@@ -1950,6 +2233,9 @@ void setup() {
   tft.init();
   tft.setRotation(cfg.flipped ? 2 : 0);
   tft.fillScreen(TFT_BLACK);
+  // Before the backlight comes on: a tilt wake with the arm hanging down
+  // goes back to sleep without lighting the screen.
+  if (!raiseToWakeAtBoot(wake)) goToSleep();
   if (backgroundSync) displayOff();
   else applyBrightness();
 
@@ -1975,6 +2261,10 @@ void setup() {
     pressPending = true;
     pressPendingAt = 0;             // the wake press happened at boot
     pressIsWake = true;
+    enterScreen(SCREEN_CLOCK);
+  } else if (wake == ESP_SLEEP_WAKEUP_ULP) {
+    // Raised wrist: the clock, briefly, unless the watch gets touched.
+    tiltWakeUntouched = true;
     enterScreen(SCREEN_CLOCK);
   } else if (wake == ESP_SLEEP_WAKEUP_EXT0 || wake == ESP_SLEEP_WAKEUP_TIMER) {
     enterScreen(SCREEN_CLOCK);      // woken by a tap, or a console drift test
@@ -2068,6 +2358,14 @@ void loop() {
   int16_t tx = 0, ty = 0;
   bool tap = tapped(tx, ty);
 
+  // A touch or a press turns a tilt wake into a normal one, with the
+  // normal timeouts from now on.
+  if (tiltWakeUntouched && (fingerDown || pressPending || press != PRESS_NONE)) {
+    tiltWakeUntouched = false;
+    tiltStats.used++;
+    screenSince = millis();
+  }
+
   // Keep the status bar current: new minute, phone link change.
   if (linkChanged) {
     linkChanged = false;
@@ -2088,7 +2386,8 @@ void loop() {
       if (tap) {
         startBle();
         enterScreen(SCREEN_MENU);
-      } else if (onScreen > clockShowMs()) {
+      } else if (onScreen > watch::clockTimeoutMs(tiltWakeUntouched, clockShowMs())) {
+        if (tiltWakeUntouched) tiltStats.expired++;
         goToSleep();
       }
       break;
