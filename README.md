@@ -32,11 +32,13 @@ phone app's job.
   30 s). Only on battery below 30 % does it fall back to timeouts.
 - **Deep sleep** between uses; wakes on a tap, the side button or a raised
   wrist.
-- **Raise to wake**: turning the wrist to look at the watch shows the clock
-  for 4 s; touching the watch or pressing the button keeps it on as usual.
+- **Raise to wake**: turning the watch into the pose you read it in (you
+  calibrate it once) shows the clock for 4 s; touching the watch or pressing
+  the button keeps it on as usual. Three sensitivity levels.
   See [Raise to wake](#raise-to-wake).
 - **Settings** stored in flash: brightness (5–100 %), interface color, screen
-  timeout, vibration, 180° screen rotation, raise to wake.
+  timeout, vibration, 180° screen rotation, raise to wake (on/off,
+  sensitivity, calibration).
 - **Haptic feedback** through the built-in DRV2605 motor driver.
 - **Accurate clock**: the PCF8563 RTC (quartz) is the reference and is
   checked on every wake; the phone sets it on every connect, and once a day
@@ -56,7 +58,7 @@ Pins follow LILYGO's
 | FT6336 touch | taps, sliders, wake from sleep | I2C on 39/40, INT 16 |
 | AXP2101 PMU | power rails, side button, battery | I2C on 10/11, IRQ 21 |
 | PCF8563 RTC | keeps time across power loss | I2C on 10/11 |
-| BMA423 accelerometer | raise to wake (wrist-tilt gesture) | I2C on 10/11, INT1 14 |
+| BMA423 accelerometer | raise to wake (pose, read by the ULP in deep sleep) | I2C on 10/11 (INT1 on 14, unused) |
 | DRV2605 | vibration | I2C on 10/11, powered from BLDO2 |
 | PDM microphone | voice recording | clock 44, data 47 |
 
@@ -70,7 +72,7 @@ T-Watch S3 it is a plain push button with no rotary encoder (LilyGoLib reports
 | Action | Result |
 |---|---|
 | Tap the screen (asleep) | Wake and show the clock |
-| Raise the wrist (asleep) | Show the clock for 4 s; a touch or a press keeps the watch awake |
+| Raise the wrist into the calibrated pose (asleep) | Show the clock for 4 s; a touch or a press keeps the watch awake |
 | Tap while the clock is shown | Info screen: phone link, last server answer, **Settings** button |
 | Side button, single press | Sleep (or wake, when asleep) |
 | Side button, double press | Start recording, also straight from sleep |
@@ -85,8 +87,10 @@ and not charging; then it waits 20 s for the phone and 60 s for the answer.
 A single press cancels the wait at any time.
 
 In **Settings**, tap *Brightness*, *Color* or *Sleep after* to open a slider and
-drag a finger along it; tap *Vibration*, *Rotate* or *Raise to wake* to toggle
-them.
+drag a finger along it; tap *Vibration* or *Rotate* to toggle them. *Raise to
+wake* opens its own page: tap *Raise to wake* to switch it on or off, *Wake
+sens* to cycle Low / Med / High, and *Calibrate wake* to store the pose (see
+[Raise to wake](#raise-to-wake)).
 
 ## BLE protocol
 
@@ -160,7 +164,7 @@ per line); `H` lists them:
 | `N<0\|1>` | RTC correction on wake off/on (tests; off lasts until reset) |
 | `S` | hardware probe: I2C devices, sensors, radio, GPS, microphone |
 | `P<sec>` | raw touch controller registers for <sec> seconds (diagnosing touch wakes) |
-| `G` | raise to wake: setting, BMA423 state, INT1 level, how the tilt wakes since power-on ended |
+| `G` | raise to wake: pose, thresholds, current reading, ULP state and counters, how raise wakes ended |
 | `W` | UI test: the waiting screen with the response timer running |
 | `A<text>` | UI test: an answer from the server, e.g. `AOK: lights on`, `AERROR: timeout` |
 
@@ -214,40 +218,113 @@ correction on.
 
 ## Raise to wake
 
-The BMA423's feature engine recognizes the wrist-tilt gesture and raises its
-INT1 line (GPIO 14). The ESP32-S3 has no pin wake left for it: ext0 watches
-the touch line, ext1 the PMU's, and ext1 on the S3 can only wake when *all*
-its pins are low, so GPIO 14 cannot simply join it. Instead the ULP
-coprocessor (the FSM) runs a six-instruction program every 100 ms during deep
-sleep: if INT1 is high, it wakes the CPU (wake cause `ESP_SLEEP_WAKEUP_ULP`).
-The Arduino core reserves no RTC memory for the ULP, so the program is built
-with the IDF's `ulp.h` macros and copied into an `RTC_DATA_ATTR` array by
-hand.
+The watch wakes when it is turned into a stored pose: the way you hold it to
+read it. In deep sleep the ULP coprocessor (the FSM) reads the BMA423 every
+100 ms and wakes the CPU (wake cause `ESP_SLEEP_WAKEUP_ULP`) on a
+*transition into* that pose.
 
-- INT1 is push-pull, active high and **latched**: it stays high until the
-  firmware reads the interrupt status, so a 100 ms poll misses nothing. The
-  status is read on every boot and again right before sleeping; if the line
-  is still high then, the ULP is not armed (it would wake the watch at once).
-- After a tilt wake the clock stays up for 4 s unless the watch is touched or
-  the button is pressed. If the watch hangs vertically (arm down, screen tilted
-  less than ~24° from vertical) it goes back to sleep without lighting the
-  screen.
-- Three tilt wakes in a row without a tilt event in the chip's status pause
-  raise to wake until the next wake by touch or button (guard against a
-  stuck or noisy line).
-- The BMA423 stays powered and configured through deep sleep (low-power mode,
-  50 Hz). Its 6 KB feature config (Bosch, via SensorLib) is uploaded again
-  only when the chip has lost it. The axis remap follows the *Rotate*
-  setting.
-- With the setting off the accelerometer is suspended and the ULP is not
-  started.
-- Cost: roughly 20–40 µA extra in deep sleep (accelerometer in low-power
-  mode plus the ULP's polls), and about 4 s of screen time per false gesture.
+**Calibrating.** Settings > Raise to wake > *Calibrate wake*. Hold the watch
+as when reading it and keep it still during the 3-2-1 countdown. The
+samples of the last two seconds are averaged into a gravity vector, stored
+in flash in the accelerometer's own axes (so the *Rotate* setting does not
+matter). It is rejected if the watch moved (more than 120 mg peak to peak on
+an axis, about 7°) or the mean is far from 1 g (0.85–1.15 g); the screen
+then says why. Without a calibration a default applies: screen facing up
+(the chip's z axis at -1 g; the chip sits on the bottom layer of the board).
+
+**Sensitivity.** How close to the stored pose the watch has to be, as a box
+per axis around the stored vector (the ULP has no multiply, so no angles):
+
+| Wake sens | wakes within | re-arms beyond |
+|---|---|---|
+| Low  | ~12° (±209 mg per axis) | ~27° (±467 mg) |
+| Med  | ~18° (±313 mg) | ~33° (±568 mg) |
+| High | ~25° (±433 mg) | ~40° (±684 mg) |
+
+A turn up to the first angle always counts as the pose, whatever its
+direction; turned past the second angle the watch counts as away. Turns that
+move two or three axes at once (diagonal to the boxes) get up to ~1.4 times
+more room on both.
+
+**Detector** (`watch::poseStep` in `lib/WatchCore/src/wrist_wake.h`; the ULP
+program implements the same steps):
+
+- the watch has to be outside the wider "re-arm" box for 4 samples in a row
+  (0.4 s), which arms the detector;
+- then 2 samples in a row (0.2 s) inside the "wake" box wake the CPU and
+  disarm the detector;
+- it is also disarmed every time the watch goes to sleep. A watch lying
+  still in the pose (on a desk, say) or still being looked at never wakes
+  again until it has left the pose.
+
+**After the wake** the CPU reads the accelerometer itself (about 0.3 s
+later). If the watch is already outside the re-arm box again, it goes back
+to sleep without lighting the screen. Otherwise the clock shows for 4 s
+unless the watch is touched or the button is pressed. Three unconfirmed
+wakes in a row pause raise to wake until the next wake by touch or button
+(guard against a wake loop).
+
+**The ULP program** (`src/pose_ulp.*`). The BMA423 is on the shared I2C bus
+(GPIO 10/11, with the PMU, the PCF8563 and the DRV2605). Those are RTC GPIOs
+on the S3 but not the RTC I2C pins, so the program bit-bangs I2C through the
+RTC GPIO registers:
+
+- before sleeping the CPU finishes its own I2C traffic, then switches SDA and
+  SCL to the RTC IO mux as **open-drain** pads with the output latch at 1
+  (released) and pull-ups on. The program pulls a line low by writing its
+  latch to 0, so it can never drive a line high against a device;
+- each run (~0.8 ms) checks that the bus is idle, sends START, `0x19`+W,
+  register `0x13`, repeated START, `0x19`+R, reads five bytes (X_MSB, Y_LSB,
+  Y_MSB, Z_LSB, Z_MSB; the last one NACKed) and a STOP. Only the high bytes
+  are used: 64 counts per g in the ±2 g range. SCL runs at ~115 kHz (high
+  ≥ 4 µs, low ≥ 4.6 µs). Only address 0x19 is ever sent;
+- a missing ACK ends the transfer with a STOP and counts an error; SDA held
+  low by a device is freed with nine clocks and a STOP; SCL held low makes
+  the run skip the bus entirely;
+- on every boot the CPU stops the ULP timer, waits for a run in progress to
+  finish (a busy flag the program sets and clears) and only then hands the
+  pins back to the digital I2C peripheral.
+
+The Arduino core reserves no RTC memory for the ULP, so the program (259
+words, 320 reserved) and its variables (28 words) are `RTC_DATA_ATTR` arrays;
+the program is encoded at run time against wherever the linker put them and
+started with `ulp_run()`. Shared variables are written to both half-words,
+since the IDF documents the S3's LD instruction both ways. To check the
+program on the PC after changing it:
+
+```sh
+tools/pose_ulp_check/check.sh       # add -l for a listing of the encoded words
+```
+
+It builds the encoder against the ESP-IDF headers from the PlatformIO
+install, decodes and executes the words against a simulated BMA423 on an
+open-drain bus, checks the I2C sequence and timing, the error paths, and
+compares every wake decision with `watch::poseStep`.
+
+**The accelerometer** runs without its feature engine (no config upload):
+low-power mode, 25 Hz, 4-sample averaging, ±2 g, interrupt outputs off. It
+stays powered and configured through deep sleep; after power-on it is
+soft-reset once (this also clears the previous firmware's wrist-tilt setup).
+With raise to wake off it is suspended and the ULP is not started.
+
+**Cost** in deep sleep, estimated: the BMA423 in low-power mode ~10–15 µA,
+the ULP runs ~2 µA, the pull-up current while the bus is driven low ~3–5 µA
+(with 10 kΩ pull-ups): roughly 15–25 µA in all. Plus about 4 s of screen
+time per false raise.
+
+`G` on the USB console shows: the setting, sensitivity, stored pose and
+thresholds; the current reading and its zone; the boxes in ULP units; the
+ULP's counters (`runs`, `errors`, `last_error`, `wakes`), its last sample,
+zone and detector state, the sample that woke the CPU; and how raise wakes
+ended (`shown`, `moved`: went back to sleep dark, `expired`, `used`).
+`last_error`: 1 SCL held low, 2 SDA held low (freed), 3/4/5 no ACK to the
+address, register, or read address.
 
 ## Tests
 
 ```sh
 pio test -e native                          # unit tests of lib/WatchCore, on the PC
+tools/pose_ulp_check/check.sh               # the raise-to-wake ULP program, emulated on the PC
 tools/clock_drift_test.py --cycles 6 --sleep 60   # on the watch (awake, plugged in)
 ```
 
@@ -270,16 +347,18 @@ tools/clock_drift_test.py --cycles 6 --sleep 60   # on the watch (awake, plugged
 .
 ├── platformio.ini               # board, flash/PSRAM, libraries, display setup; native test env
 ├── src/
-│   └── twatch_command_client.ino   # the firmware
+│   ├── twatch_command_client.ino   # the firmware
+│   └── pose_ulp.*               # raise to wake: the ULP program (bit-banged I2C + detector)
 ├── lib/WatchCore/src/           # hardware-independent logic, unit-tested on the PC
 │   ├── clock_sync.*             # TIME parsing, RTC correction, background sync schedule
 │   ├── server_reply.*           # OK/REJECTED/ERROR/progress, safe UTF-8 copy
 │   ├── power_policy.h           # when the watch may time out / sync in the background
-│   ├── wrist_wake.h             # raise to wake: tilt-wake timeout, orientation check, loop guard
+│   ├── wrist_wake.h             # raise to wake: pose boxes, detector, calibration, loop guard
 │   ├── text_wrap.*              # word wrap by pixel width, UTF-8 aware
 │   └── time_format.*            # response timer and duration text
 ├── test/                        # Unity tests for lib/WatchCore (pio test -e native)
 └── tools/
     ├── clock_drift_test.py      # drift measurement on the watch
+    ├── pose_ulp_check/          # PC check of the encoded ULP program (emulated)
     └── watch_console.py         # USB console client (sensor probe, set time)
 ```
