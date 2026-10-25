@@ -241,6 +241,7 @@ int64_t lastTickCorrectionUs = 0;   // diagnostics: sub-second step from the RTC
 
 enum WakePlan : uint8_t { WAKE_PLAN_NONE, WAKE_PLAN_SYNC, WAKE_PLAN_TEST };
 RTC_DATA_ATTR uint8_t wakePlan = WAKE_PLAN_NONE;  // why the sleep timer was armed
+bool raiseTestArmed = false;        // console "Y": the next sleep starts with the detector armed
 uint32_t keepAwakeUntil = 0;        // console "K": no idle sleep until then
 uint32_t testSleepSeconds = 0;      // console "Z": next sleep wakes by timer
 
@@ -1961,6 +1962,11 @@ bool loadRaiseToWakeUlp(uint32_t &codeWord) {
   ulpSet(poseulp::V_ARMED, 0);
   ulpSet(poseulp::V_MATCH_RUN, 0);
   ulpSet(poseulp::V_BUSY, 0);
+  if (raiseTestArmed) {             // console "Y": as if the watch had just been away
+    raiseTestArmed = false;
+    ulpSet(poseulp::V_AWAY_RUN, watch::kAwaySamples);
+    ulpSet(poseulp::V_ARMED, 1);
+  }
   return true;
 }
 
@@ -2039,6 +2045,8 @@ void printRaiseReport() {
 
 // ---- ULP bus diagnostics (console "U"), run with the CPU awake ----
 
+RTC_DATA_ATTR volatile uint32_t ulpDbgRes[80];   // U8 results
+
 void printUlpPads(const char *tag) {
   const int sda = rtc_io_number_get((gpio_num_t)PMU_I2C_SDA), scl = rtc_io_number_get((gpio_num_t)PMU_I2C_SCL);
   Serial.printf("ULPDBG %s out=0x%08lX en=0x%08lX in=0x%08lX pad_sda=0x%08lX pad_scl=0x%08lX pin_sda=0x%08lX "
@@ -2080,14 +2088,104 @@ int cpuRtcProbe(uint8_t addr) {
   return ack;
 }
 
-// U: the sleep-time ULP program, run by its timer with the CPU awake, on
+// U[n]: the sleep-time ULP program, run by its timer with the CPU awake, on
 // the bus handed over exactly as goToSleep() does. U1: pad control only,
-// from the CPU. Wire is stopped meanwhile and restarted afterwards.
+// from the CPU. U8: the ULP's branch conditions on this chip. U9: a logic
+// capture of one run. Wire is stopped meanwhile and restarted afterwards.
 void ulpBusTest(int mode) {
   const int sda = rtc_io_number_get((gpio_num_t)PMU_I2C_SDA), scl = rtc_io_number_get((gpio_num_t)PMU_I2C_SCL);
   Wire.end();
   printUlpPads("wire_off");
-  if (mode == 1) {
+  if (mode == 8) {
+    // Branch semantics: for stage_cnt in {1, 5} (reached by STAGE_INC 1)
+    // and R0 in {0, 1, 5}: every cmp code 0..3 against thresholds 0, 1, 5, 8;
+    // 1 = taken. Results in ulpCode[256..].
+    const uint32_t codeWord = ((uintptr_t)ulpCode - SOC_RTC_DATA_LOW) / 4;
+    const uint32_t res = ((uintptr_t)ulpDbgRes - SOC_RTC_DATA_LOW) / 4;
+    size_t n = 0, r = 0;
+    auto put = [&](const ulp_insn_t &insn) { memcpy(&ulpCode[n++], &insn, 4); };
+    const uint16_t thr[4] = {0, 1, 5, 8};
+    put((ulp_insn_t)I_MOVI(R3, res));
+    for (int stage : {1, 5}) {
+      put((ulp_insn_t)I_STAGE_RST(0, 0, 0));
+      for (int k = 0; k < stage; k++) put((ulp_insn_t)I_STAGE_INC(0, 0, 1));
+      for (int cmp = 0; cmp < 4; cmp++)
+        for (int t = 0; t < 4; t++) {
+          put((ulp_insn_t)I_MOVI(R0, 1));
+          ulp_insn_t b = I_BSL(2, thr[t]);
+          b.b.cmp = cmp;
+          put(b);
+          put((ulp_insn_t)I_MOVI(R0, 0));
+          put((ulp_insn_t)I_ST(R0, R3, r++));
+        }
+    }
+    for (int v : {0, 1, 5})
+      for (int cmp = 0; cmp < 4; cmp++)
+        for (int t = 0; t < 4; t++) {
+          put((ulp_insn_t)I_MOVI(R1, 1));
+          put((ulp_insn_t)I_MOVI(R0, v));
+          ulp_insn_t b = I_BL(2, thr[t]);
+          b.b.cmp = cmp;
+          put(b);
+          put((ulp_insn_t)I_MOVI(R1, 0));
+          put((ulp_insn_t)I_ST(R1, R3, r++));
+        }
+    put((ulp_insn_t)I_HALT());
+    for (size_t i = 0; i < r; i++) ulpDbgRes[i] = 0xEEEE;
+    Serial.printf("ULPDBG branch test: %u words, %u results\n", (unsigned)n, (unsigned)r);
+    ulp_set_wakeup_period(0, 20000);
+    ulp_run(codeWord);
+    delay(60);
+    ulp_timer_stop();
+    r = 0;
+    for (int stage : {1, 5})
+      for (int cmp = 0; cmp < 4; cmp++) {
+        Serial.printf("BS stage=%d cmp=%d:", stage, cmp);
+        for (int t = 0; t < 4; t++) Serial.printf(" <thr %u>=%lu", thr[t], (unsigned long)(ulpDbgRes[r++] & 0xFFFF));
+        Serial.println();
+      }
+    for (int v : {0, 1, 5})
+      for (int cmp = 0; cmp < 4; cmp++) {
+        Serial.printf("B r0=%d cmp=%d:", v, cmp);
+        for (int t = 0; t < 4; t++) Serial.printf(" <thr %u>=%lu", thr[t], (unsigned long)(ulpDbgRes[r++] & 0xFFFF));
+        Serial.println();
+      }
+  } else if (mode == 9) {
+    // Logic capture of one run of the real program: every SDA/SCL change,
+    // timestamped in CPU cycles.
+    uint32_t codeWord = 0;
+    if (loadRaiseToWakeUlp(codeWord)) {
+      handBusToUlp();
+      static uint32_t ts[600];
+      static uint8_t lv[600];
+      int n = 0;
+      const uint32_t mask = BIT(RTC_GPIO_IN_NEXT_S + sda) | BIT(RTC_GPIO_IN_NEXT_S + scl);
+      const uint32_t idle = REG_READ(RTC_GPIO_IN_REG) & mask;
+      ulp_set_wakeup_period(0, 20000);
+      ulp_run(codeWord);
+      const uint32_t t0 = millis();
+      while ((REG_READ(RTC_GPIO_IN_REG) & mask) == idle && millis() - t0 < 500) {
+      }
+      portDISABLE_INTERRUPTS();
+      const uint32_t c0 = xthal_get_ccount();
+      uint32_t last = 0xFFFFFFFF;
+      while (n < 600 && xthal_get_ccount() - c0 < 240 * 3000) {
+        const uint32_t v = REG_READ(RTC_GPIO_IN_REG) & mask;
+        if (v != last) {
+          ts[n] = xthal_get_ccount() - c0;
+          lv[n++] = ((v >> (RTC_GPIO_IN_NEXT_S + sda)) & 1) | (((v >> (RTC_GPIO_IN_NEXT_S + scl)) & 1) << 1);
+          last = v;
+        }
+      }
+      portENABLE_INTERRUPTS();
+      ulp_timer_stop();
+      delay(2);
+      Serial.printf("ULPDBG capture %d changes (t in us, sda scl)\n", n);
+      for (int i = 0; i < n; i++) Serial.printf("CAP %.2f %d %d\n", ts[i] / 240.0, lv[i] & 1, lv[i] >> 1);
+      Serial.printf("ULPDBG runs=%u errors=%u last_error=%u\n", ulpGet(poseulp::V_RUNS), ulpGet(poseulp::V_ERRORS),
+                    ulpGet(poseulp::V_LAST_ERROR));
+    }
+  } else if (mode == 1) {
     handBusToUlp();
     printUlpPads("handed");
     for (int io : {scl, sda}) {
@@ -2123,7 +2221,7 @@ void ulpBusTest(int mode) {
       while (ulpGet(poseulp::V_BUSY) && micros() - since < ULP_BUSY_WAIT_US) {
       }
       printUlpPads("after");
-      Serial.printf("ULPDBG runs=%u in %lu us, rtc_fast=%u Hz\n", ulpGet(poseulp::V_RUNS), (unsigned long)elapsed,
+      Serial.printf("ULPDBG runs=%u in %lu us, rtc_fast_src=%u (1 = RC_FAST)\n", ulpGet(poseulp::V_RUNS), (unsigned long)elapsed,
                     (unsigned)rtc_clk_fast_freq_get());
     }
   }
@@ -2369,6 +2467,9 @@ void printHelp() {
       "  G        raise to wake: pose, thresholds, accel now, ULP state and counters\n"
       "  U[n]     raise to wake: run the ULP program awake for n runs (default 5), then G\n"
       "  U1       raise to wake: pad check and address probes from the CPU over the RTC pads\n"
+      "  U8       raise to wake: ULP branch conditions on this chip (R0 and stage_cnt)\n"
+      "  U9       raise to wake: logic capture of one ULP run (SDA/SCL changes, us)\n"
+      "  Y        raise to wake: sleep with the detector armed (wakes at once in the pose)\n"
       "  K<sec>   stay awake for <sec> (debugging; K0 ends it)\n"
       "  W        UI test: show the waiting screen with the response timer\n"
       "  A<text>  UI test: an answer from the server, e.g. AOK: lights on\n"
@@ -2430,6 +2531,12 @@ void handleCommand(const String &line) {
     case 'P': dumpTouch(constrain(atol(arg), 1, 60)); break;
     case 'G': printRaiseReport(); break;
     case 'U': ulpBusTest(atoi(arg)); break;
+    case 'Y':                       // raise-wake test without moving the watch
+      raiseTestArmed = true;
+      keepAwakeUntil = millis();
+      Serial.println("sleeping, detector armed: a sample in the pose wakes the watch");
+      goToSleep();
+      break;
     case 'K':                       // debugging: stay awake for <sec>
       keepAwakeUntil = millis() + 1000UL * constrain(atol(arg), 0, 3600);
       Serial.printf("awake for %ld s\n", constrain(atol(arg), 0, 3600));

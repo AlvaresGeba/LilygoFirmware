@@ -165,8 +165,11 @@ per line); `H` lists them:
 | `S` | hardware probe: I2C devices, sensors, radio, GPS, microphone |
 | `P<sec>` | raw touch controller registers for <sec> seconds (diagnosing touch wakes) |
 | `G` | raise to wake: pose, thresholds, current reading, ULP state and counters, how raise wakes ended |
-| `U[n]` | raise to wake: the sleep-time ULP program run awake on the handed-over bus for n runs (default 5), then `G` |
+| `U[n]` | raise to wake: the sleep-time ULP program run awake on the handed-over bus for n runs (default 5; n not 1, 8 or 9), then `G` |
 | `U1` | raise to wake: RTC pad check and address probes bit-banged by the CPU over the RTC pads |
+| `U8` | raise to wake: the ULP's branch conditions on this chip (R0 and stage_cnt), see below |
+| `U9` | raise to wake: logic capture of one ULP run (every SDA/SCL change, in µs) |
+| `Y` | raise to wake: sleep now with the detector armed; held in the pose, the watch wakes at once (tests the wake path without moving it) |
 | `K<sec>` | stay awake for <sec> seconds (debugging over USB; `K0` ends it) |
 | `W` | UI test: the waiting screen with the response timer running |
 | `A<text>` | UI test: an answer from the server, e.g. `AOK: lights on`, `AERROR: timeout` |
@@ -287,8 +290,13 @@ RTC GPIO registers:
 - on every boot the CPU stops the ULP timer, waits for a run in progress to
   finish (a busy flag the program sets and clears) and only then hands the
   pins back to the digital I2C peripheral.
+- the bit loops end on `stage_cnt == n`: on the S3 only the EQ condition of
+  the stage branch (JUMPS) works. Measured with `U8`: the codes the IDF's
+  `ulp.h` emits for `I_BSL` (stage_cnt < n) and `I_BSGE` are never taken,
+  which made every byte loop run once and every run end in a NACK. R0
+  branches (`I_BL`, `I_BG`, EQ) work as documented.
 
-The Arduino core reserves no RTC memory for the ULP, so the program (259
+The Arduino core reserves no RTC memory for the ULP, so the program (262
 words, 320 reserved) and its variables (28 words) are `RTC_DATA_ATTR` arrays;
 the program is encoded at run time against wherever the linker put them and
 started with `ulp_run()`. Shared variables are written to both half-words,

@@ -7,7 +7,8 @@
 //
 // Instruction timings are estimates from the ESP32 TRM (ALU 6 cycles,
 // LD/ST 8, jumps 4, REG_RD 8, REG_WR 12, WAIT 2+n) at 17.5 MHz; the
-// half-word ambiguity of LD on the S3 is run both ways.
+// half-word ambiguity of LD on the S3 is run both ways. Stage branches
+// (JUMPS) follow the S3 as measured on the watch: only EQ is taken.
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -284,7 +285,10 @@ struct Ulp {
               take = cmp == 0 ? r[0] < imm : cmp == 1 ? r[0] > imm : r[0] == imm;
             } else {
               CHECK(sub == 2, "branch sub %u", sub);
-              take = cmp == 0 ? stage < imm : cmp == 1 ? stage >= imm : stage <= imm;
+              // Measured on the watch (console U8): only EQ (cmp 2, 3)
+              // works; the LT/GE codes of the IDF's ulp.h are never taken.
+              CHECK(cmp >= 2, "stage branch cmp %u at %u: never taken on the S3", cmp, pc);
+              take = cmp >= 2 && stage == imm;
             }
             if (take) next = sign ? pc - off : pc + off;
           }
@@ -375,7 +379,7 @@ static void disassemble(const Ulp &u, size_t words) {
           const int off = ((w >> 25) & 1) ? -(int)((w >> 18) & 0x7F) : (int)((w >> 18) & 0x7F);
           const uint32_t cmp = (w >> 16) & 3;
           printf("%s %u (%+d), %u, %s", sub == 0 ? "JUMPR" : "JUMPS", a + off, off, w & 0xFFFF,
-                 sub == 0 ? (cmp == 0 ? "LT" : cmp == 1 ? "GT" : "EQ") : (cmp == 0 ? "LT" : cmp == 1 ? "GE" : "LE"));
+                 sub == 0 ? (cmp == 0 ? "LT" : cmp == 1 ? "GT" : "EQ") : (cmp == 0 ? "LT(dead)" : cmp == 1 ? "GE(dead)" : "EQ"));
         }
         break;
       }

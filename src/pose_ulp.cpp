@@ -17,7 +17,7 @@
 //      ready to be woken, as the earlier INT1 poll did).
 // R3 holds the address of the variables block, R2 the return address of
 // the two byte subroutines, R1 the byte, R0 scratch and compare results;
-// stage_cnt counts bits.
+// stage_cnt counts bits (loops end on stage_cnt == n, see loopUntilStage).
 
 #include "pose_ulp.h"
 
@@ -58,10 +58,20 @@ class Asm {
   }
   void label(int id) { labels_[id] = (int)n_; }
 
-  // Relative branches: R0 compared with an immediate (or stage_cnt).
+  // Relative branches: R0 compared with an immediate.
   void jumpLess(int id, uint16_t imm) { rel(id, INSN(I_BL(0, imm))); }
   void jumpGreater(int id, uint16_t imm) { rel(id, INSN(I_BG(0, imm))); }
-  void jumpStageLess(int id, uint16_t imm) { rel(id, INSN(I_BSL(0, imm))); }
+  // Loop tail: back to `id` until stage_cnt == count. On the S3 only the
+  // EQ condition of the stage branch (JUMPS) works: measured on the watch,
+  // the codes the IDF's ulp.h uses for I_BSL (0) and I_BSGE (1) are never
+  // taken, so a "stage_cnt < 8" loop ran once (one address bit sent, then
+  // a NACK on every run). So: skip the jump back once the count is reached.
+  void loopUntilStage(int id, uint8_t count) {
+    ulp_insn_t skip = INSN(I_BSL(2, count));
+    skip.b.cmp = kStageCmpEq;
+    op(skip);
+    jump(id);
+  }
   // Absolute unconditional jump.
   void jump(int id) { fix(id, FIX_ABS); op(INSN(I_BXI(0))); }
   // reg = absolute address of a label (a return address).
@@ -102,6 +112,7 @@ class Asm {
   size_t size() const { return n_; }
 
  private:
+  static constexpr uint32_t kStageCmpEq = 2;   // stage branch condition: stage_cnt == imm
   enum FixKind : uint8_t { FIX_REL, FIX_ABS, FIX_MOVI };
   struct Fixup {          // small: the assembler lives on the caller's stack
     uint16_t at;
@@ -219,7 +230,7 @@ class Program {
     sclLow();
     a_.op(INSN(I_LSHI(R1, R1, 1)));
     a_.op(INSN(I_STAGE_INC(0, 0, 1)));
-    a_.jumpStageLess(bit, 8);
+    a_.loopUntilStage(bit, 8);
     sdaRelease();           // the device drives the ACK
     half();
     sclRelease();
@@ -246,7 +257,7 @@ class Program {
     a_.op(INSN(I_ORR(R1, R1, R0)));
     sclLow();
     a_.op(INSN(I_STAGE_INC(0, 0, 1)));
-    a_.jumpStageLess(bit, 8);
+    a_.loopUntilStage(bit, 8);
     load(R0, V_ACK);
     a_.jumpGreater(nack, 0);
     sdaLow();               // ACK: more bytes wanted
@@ -361,7 +372,7 @@ size_t build(uint32_t *code, size_t capacity, uint32_t codeWord, uint32_t varsWo
   p.sclRelease();
   p.half();
   a.op(INSN(I_STAGE_INC(0, 0, 1)));
-  a.jumpStageLess(recoverLoop, 9);
+  a.loopUntilStage(recoverLoop, 9);
   p.sclLow();
   p.half();
   p.stop();
