@@ -80,6 +80,8 @@
 #include <soc/rtc.h>
 #include <soc/rtc_cntl_reg.h>
 #include <soc/rtc_io_reg.h>
+#include <soc/rtc_io_periph.h>
+#include <soc/sens_reg.h>
 #include <sys/time.h>
 
 #define XPOWERS_CHIP_AXP2101
@@ -239,6 +241,7 @@ int64_t lastTickCorrectionUs = 0;   // diagnostics: sub-second step from the RTC
 
 enum WakePlan : uint8_t { WAKE_PLAN_NONE, WAKE_PLAN_SYNC, WAKE_PLAN_TEST };
 RTC_DATA_ATTR uint8_t wakePlan = WAKE_PLAN_NONE;  // why the sleep timer was armed
+uint32_t keepAwakeUntil = 0;        // console "K": no idle sleep until then
 uint32_t testSleepSeconds = 0;      // console "Z": next sleep wakes by timer
 
 enum Screen : uint8_t {
@@ -1924,17 +1927,16 @@ bool raiseToWakeReady() {
   return true;
 }
 
-// Encodes the ULP program, loads the thresholds, hands the bus over and
-// starts the ULP. Called after prepareSleepClock(): ulp_set_wakeup_period()
-// converts the period with the current sleep clock. No I2C after this.
-bool startRaiseToWakeUlp() {
+// Encodes the ULP program and loads the thresholds, with the detector
+// disarmed. codeWord: the entry point for ulp_run().
+bool loadRaiseToWakeUlp(uint32_t &codeWord) {
   const uintptr_t code = (uintptr_t)ulpCode, vars = (uintptr_t)ulpVars;
   if (code < SOC_RTC_DATA_LOW || code + sizeof(ulpCode) > SOC_RTC_DATA_HIGH || vars < SOC_RTC_DATA_LOW ||
       vars + sizeof(ulpVars) > SOC_RTC_DATA_HIGH) {
     Serial.println("sleep: raise to wake off, ULP memory not in RTC slow memory");
     return false;
   }
-  const uint32_t codeWord = (code - SOC_RTC_DATA_LOW) / sizeof(uint32_t);
+  codeWord = (code - SOC_RTC_DATA_LOW) / sizeof(uint32_t);
   const uint32_t varsWord = (vars - SOC_RTC_DATA_LOW) / sizeof(uint32_t);
   const size_t words = poseulp::build(ulpCode, poseulp::kCodeWords, codeWord, varsWord,
                                       rtc_io_number_get((gpio_num_t)PMU_I2C_SDA),
@@ -1959,7 +1961,15 @@ bool startRaiseToWakeUlp() {
   ulpSet(poseulp::V_ARMED, 0);
   ulpSet(poseulp::V_MATCH_RUN, 0);
   ulpSet(poseulp::V_BUSY, 0);
+  return true;
+}
 
+// Encodes and loads the ULP program, hands the bus over and starts the
+// ULP. Called after prepareSleepClock(): ulp_set_wakeup_period() converts
+// the period with the current sleep clock. No I2C after this.
+bool startRaiseToWakeUlp() {
+  uint32_t codeWord = 0;
+  if (!loadRaiseToWakeUlp(codeWord)) return false;
   handBusToUlp();
   // ulp_run() only arms the ULP timer: the first run comes one period
   // later, with the CPU asleep.
@@ -2025,6 +2035,101 @@ void printRaiseReport() {
                 watch::mgFromUlpUnits(ulpGet(V_WAKE_SAMPLE + 2)));
   Serial.printf("RAISE cpu wakes=%u shown=%u moved=%u expired=%u used=%u\n", raiseStats.wakes,
                 raiseStats.shown, raiseStats.moved, raiseStats.expired, raiseStats.used);
+}
+
+// ---- ULP bus diagnostics (console "U"), run with the CPU awake ----
+
+void printUlpPads(const char *tag) {
+  const int sda = rtc_io_number_get((gpio_num_t)PMU_I2C_SDA), scl = rtc_io_number_get((gpio_num_t)PMU_I2C_SCL);
+  Serial.printf("ULPDBG %s out=0x%08lX en=0x%08lX in=0x%08lX pad_sda=0x%08lX pad_scl=0x%08lX pin_sda=0x%08lX "
+                "pin_scl=0x%08lX clkgate=0x%08lX sda=%lu scl=%lu\n",
+                tag, (unsigned long)REG_READ(RTC_GPIO_OUT_REG), (unsigned long)REG_READ(RTC_GPIO_ENABLE_REG),
+                (unsigned long)REG_READ(RTC_GPIO_IN_REG), (unsigned long)REG_READ(rtc_io_desc[sda].reg),
+                (unsigned long)REG_READ(rtc_io_desc[scl].reg), (unsigned long)REG_READ(RTC_GPIO_PIN0_REG + 4 * sda),
+                (unsigned long)REG_READ(RTC_GPIO_PIN0_REG + 4 * scl),
+                (unsigned long)REG_READ(SENS_SAR_PERI_CLK_GATE_CONF_REG),
+                (unsigned long)((REG_READ(RTC_GPIO_IN_REG) >> (RTC_GPIO_IN_NEXT_S + sda)) & 1),
+                (unsigned long)((REG_READ(RTC_GPIO_IN_REG) >> (RTC_GPIO_IN_NEXT_S + scl)) & 1));
+}
+
+// The CPU bit-bangs an address byte through the RTC GPIO registers, the
+// way the ULP program does (masked writes of RTC_GPIO_OUT, reads of
+// RTC_GPIO_IN); returns the ACK bit (0 = acknowledged).
+int cpuRtcProbe(uint8_t addr) {
+  const int sda = rtc_io_number_get((gpio_num_t)PMU_I2C_SDA), scl = rtc_io_number_get((gpio_num_t)PMU_I2C_SCL);
+  auto line = [](int io, int v) {
+    if (v) REG_SET_BIT(RTC_GPIO_OUT_REG, BIT(RTC_GPIO_OUT_DATA_S + io));
+    else REG_CLR_BIT(RTC_GPIO_OUT_REG, BIT(RTC_GPIO_OUT_DATA_S + io));
+    delayMicroseconds(10);
+  };
+  line(sda, 0);
+  line(scl, 0);
+  uint8_t b = addr << 1;
+  for (int i = 0; i < 8; i++, b <<= 1) {
+    line(sda, b & 0x80);
+    line(scl, 1);
+    line(scl, 0);
+  }
+  line(sda, 1);
+  line(scl, 1);
+  const int ack = (REG_READ(RTC_GPIO_IN_REG) >> (RTC_GPIO_IN_NEXT_S + sda)) & 1;
+  line(scl, 0);
+  line(sda, 0);
+  line(scl, 1);
+  line(sda, 1);
+  return ack;
+}
+
+// U: the sleep-time ULP program, run by its timer with the CPU awake, on
+// the bus handed over exactly as goToSleep() does. U1: pad control only,
+// from the CPU. Wire is stopped meanwhile and restarted afterwards.
+void ulpBusTest(int mode) {
+  const int sda = rtc_io_number_get((gpio_num_t)PMU_I2C_SDA), scl = rtc_io_number_get((gpio_num_t)PMU_I2C_SCL);
+  Wire.end();
+  printUlpPads("wire_off");
+  if (mode == 1) {
+    handBusToUlp();
+    printUlpPads("handed");
+    for (int io : {scl, sda}) {
+      REG_CLR_BIT(RTC_GPIO_OUT_REG, BIT(RTC_GPIO_OUT_DATA_S + io));
+      delayMicroseconds(20);
+      printUlpPads(io == scl ? "scl_low" : "sda_low");
+      REG_SET_BIT(RTC_GPIO_OUT_REG, BIT(RTC_GPIO_OUT_DATA_S + io));
+      delayMicroseconds(20);
+      printUlpPads(io == scl ? "scl_rel" : "sda_rel");
+    }
+    Serial.printf("ULPDBG cpu probe 0x19 ack=%d 0x51 ack=%d 0x34 ack=%d 0x7F ack=%d\n", cpuRtcProbe(0x19),
+                  cpuRtcProbe(0x51), cpuRtcProbe(0x34), cpuRtcProbe(0x7F));
+  } else {
+    uint32_t codeWord = 0;
+    if (!loadRaiseToWakeUlp(codeWord)) {
+      Serial.println("ULPDBG load failed");
+    } else {
+      ulpSet(poseulp::V_RUNS, 0);
+      ulpSet(poseulp::V_ERRORS, 0);
+      ulpSet(poseulp::V_LAST_ERROR, 0);
+      handBusToUlp();
+      printUlpPads("handed");
+      const uint32_t t0 = micros();
+      if (ulp_set_wakeup_period(0, ULP_POLL_MS * 1000) != ESP_OK || ulp_run(codeWord) != ESP_OK) {
+        Serial.println("ULPDBG ulp_run failed");
+      }
+      const int want = mode >= 2 ? mode : 5;
+      while (ulpGet(poseulp::V_RUNS) < want && micros() - t0 < (uint32_t)(want + 3) * ULP_POLL_MS * 1000) delay(1);
+      const uint32_t elapsed = micros() - t0;
+      ulp_timer_stop();
+      delayMicroseconds(50);
+      const uint32_t since = micros();
+      while (ulpGet(poseulp::V_BUSY) && micros() - since < ULP_BUSY_WAIT_US) {
+      }
+      printUlpPads("after");
+      Serial.printf("ULPDBG runs=%u in %lu us, rtc_fast=%u Hz\n", ulpGet(poseulp::V_RUNS), (unsigned long)elapsed,
+                    (unsigned)rtc_clk_fast_freq_get());
+    }
+  }
+  takeBusFromUlp();
+  Wire.begin(PMU_I2C_SDA, PMU_I2C_SCL);
+  printRaiseReport();
 }
 
 // ---------------------------------------------------------------------
@@ -2262,6 +2367,9 @@ void printHelp() {
       "  S        hardware probe: I2C devices, sensors, radio, microphone\n"
       "  P<sec>   raw touch controller registers for <sec>\n"
       "  G        raise to wake: pose, thresholds, accel now, ULP state and counters\n"
+      "  U[n]     raise to wake: run the ULP program awake for n runs (default 5), then G\n"
+      "  U1       raise to wake: pad check and address probes from the CPU over the RTC pads\n"
+      "  K<sec>   stay awake for <sec> (debugging; K0 ends it)\n"
       "  W        UI test: show the waiting screen with the response timer\n"
       "  A<text>  UI test: an answer from the server, e.g. AOK: lights on\n"
       "  H        this help");
@@ -2321,6 +2429,11 @@ void handleCommand(const String &line) {
       break;
     case 'P': dumpTouch(constrain(atol(arg), 1, 60)); break;
     case 'G': printRaiseReport(); break;
+    case 'U': ulpBusTest(atoi(arg)); break;
+    case 'K':                       // debugging: stay awake for <sec>
+      keepAwakeUntil = millis() + 1000UL * constrain(atol(arg), 0, 3600);
+      Serial.printf("awake for %ld s\n", constrain(atol(arg), 0, 3600));
+      break;
     case 'H': printHelp(); break;
     default: Serial.println("unknown command, H for help"); break;
   }
@@ -2629,6 +2742,7 @@ void handleReply(const char *text) {
 
 void loop() {
   handleSerial();
+  if ((int32_t)(keepAwakeUntil - millis()) > 0) screenSince = millis();
   serviceRtcWrite(false);
   serviceRtcTickLock();
 

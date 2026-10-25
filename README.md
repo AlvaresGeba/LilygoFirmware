@@ -165,6 +165,9 @@ per line); `H` lists them:
 | `S` | hardware probe: I2C devices, sensors, radio, GPS, microphone |
 | `P<sec>` | raw touch controller registers for <sec> seconds (diagnosing touch wakes) |
 | `G` | raise to wake: pose, thresholds, current reading, ULP state and counters, how raise wakes ended |
+| `U[n]` | raise to wake: the sleep-time ULP program run awake on the handed-over bus for n runs (default 5), then `G` |
+| `U1` | raise to wake: RTC pad check and address probes bit-banged by the CPU over the RTC pads |
+| `K<sec>` | stay awake for <sec> seconds (debugging over USB; `K0` ends it) |
 | `W` | UI test: the waiting screen with the response timer running |
 | `A<text>` | UI test: an answer from the server, e.g. `AOK: lights on`, `AERROR: timeout` |
 
